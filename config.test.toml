@@ -1,0 +1,6 @@
+listen = "127.0.0.1:8317"
+accounts_dir = "./testdata/accounts"
+# 冒烟测试直连本地 mock，不走代理；密钥全部走管理态（testdata/keys.json）
+
+[identity]
+version = "0.153.3"

@@ -1,0 +1,106 @@
+{
+  "comment": [
+    "锚定补丁清单：sync_upstream.py 在每次同步官方源码后逐条应用。",
+    "每条补丁通过 anchor（必须在官方源码中原样出现）定位，应用后校验 replacement 存在。",
+    "anchor 找不到 = 官方代码已漂移，脚本会报错并拒绝继续，防止静默产生行为分叉。",
+    "补丁是幂等的：replacement 已存在则跳过（视为已应用）。"
+  ],
+  "patches": [
+    {
+      "name": "runtime-version-override",
+      "file": "codex-rs/login/src/auth/default_client.rs",
+      "anchor": "let build_version = env!(\"CARGO_PKG_VERSION\");",
+      "replacement": "let build_version = std::env::var(\"CCODEX_CODEX_VERSION\").unwrap_or_else(|_| env!(\"CARGO_PKG_VERSION\").to_string());",
+      "occurrences": 1,
+      "why": "官方 git 仓库里 workspace 版本是 0.0.0，env!(\"CARGO_PKG_VERSION\") 会让 User-Agent 变成 codex_cli_rs/0.0.0（一眼假）。改为运行时读 CCODEX_CODEX_VERSION 环境变量，由 ccodex 启动时按 config 里的 identity.version 注入，UA 格式仍由官方代码生成。"
+    },
+    {
+      "name": "export-rate-limits-module",
+      "file": "codex-rs/codex-api/src/lib.rs",
+      "anchor": "pub(crate) mod rate_limits;",
+      "replacement": "pub mod rate_limits;",
+      "occurrences": 1,
+      "why": "官方 x-codex-primary/secondary-* 配额响应头解析逻辑是 pub(crate)。开放模块可见性，让 ccodex 的配额感知调度直接复用官方解析（parse_all_rate_limits），不用自己重写。"
+    },
+    {
+      "name": "ua-fingerprint-env-override",
+      "file": "codex-rs/login/src/auth/default_client.rs",
+      "anchor": "    let os_info = os_info::get();\n    let originator = originator();\n    let prefix = format!(\n        \"{}/{build_version} ({} {}; {}) {}\",\n        originator.value.as_str(),\n        os_info.os_type(),\n        os_info.version(),\n        os_info.architecture().unwrap_or(\"unknown\"),\n        user_agent()\n    );",
+      "replacement": "    let os_info = os_info::get();\n    let originator = originator();\n    // ccodex: UA 的 OS/终端段支持环境变量覆盖（跨平台编译/运行时保持固定指纹，默认 Windows）\n    let os_type = std::env::var(\"CCODEX_UA_OS_TYPE\").unwrap_or_else(|_| os_info.os_type().to_string());\n    let os_version = std::env::var(\"CCODEX_UA_OS_VERSION\").unwrap_or_else(|_| os_info.version().to_string());\n    let os_arch = std::env::var(\"CCODEX_UA_ARCH\").ok().or_else(|| os_info.architecture().map(str::to_string)).unwrap_or_else(|| \"unknown\".to_string());\n    let terminal = std::env::var(\"CCODEX_UA_TERMINAL\").unwrap_or_else(|_| user_agent());\n    let prefix = format!(\"{}/{build_version} ({os_type} {os_version}; {os_arch}) {terminal}\", originator.value.as_str());",
+      "occurrences": 1,
+      "why": "UA 的 OS/终端段默认取自运行环境（os_info/terminal-detection）。在 Linux 服务器上编译运行时会变成 Linux 指纹，与主流客户端（Windows/macOS 桌面）不符。改为 CCODEX_UA_* 环境变量可覆盖，缺省保持官方逻辑。"
+    },
+    {
+      "name": "export-oauth-flow-issuer",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "pub(super) const DEFAULT_ISSUER: &str = \"https://auth.openai.com\";",
+      "replacement": "pub const DEFAULT_ISSUER: &str = \"https://auth.openai.com\";",
+      "occurrences": 1,
+      "why": "ccodex 复用官方浏览器 OAuth 登录流（authorize URL 构造 + code 换 token + 持久化），需要 DEFAULT_ISSUER 可见。纯可见性开放，逻辑不变。"
+    },
+    {
+      "name": "export-oauth-flow-authorize-url",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "fn build_authorize_url(",
+      "replacement": "pub fn build_authorize_url(",
+      "occurrences": 1,
+      "why": "同上：无头服务器无法本地起回调端口，需要直接调用官方 build_authorize_url 生成授权链接（含官方 scope/PKCE/state 参数），让用户在任意浏览器完成后回贴 callback URL。"
+    },
+    {
+      "name": "export-oauth-flow-generate-state",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "fn generate_state() -> String {",
+      "replacement": "pub fn generate_state() -> String {",
+      "occurrences": 1,
+      "why": "同上：state 由官方生成器产出，保证与官方登录流一致。"
+    },
+    {
+      "name": "export-oauth-flow-exchanged-tokens",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "pub(crate) struct ExchangedTokens {",
+      "replacement": "pub struct ExchangedTokens {",
+      "occurrences": 1,
+      "why": "同上：exchange_code_for_tokens 的返回类型需要可见。"
+    },
+    {
+      "name": "export-oauth-flow-exchange",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "pub(crate) async fn exchange_code_for_tokens(",
+      "replacement": "pub async fn exchange_code_for_tokens(",
+      "occurrences": 1,
+      "why": "同上：用官方 token 交换（含 PKCE verifier、官方错误处理），避免自己重写 token 请求。"
+    },
+    {
+      "name": "export-oauth-flow-persist",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "pub(crate) async fn persist_tokens_async(",
+      "replacement": "pub async fn persist_tokens_async(",
+      "occurrences": 1,
+      "why": "同上：auth.json 由官方 persist_tokens_async 落盘，字段形状与官方完全一致。"
+    },
+    {
+      "name": "export-oauth-flow-obtain-api-key",
+      "file": "codex-rs/login/src/server.rs",
+      "anchor": "pub(crate) async fn obtain_api_key(",
+      "replacement": "pub async fn obtain_api_key(",
+      "occurrences": 1,
+      "why": "同上：官方登录还会用 id_token 换一个 API key 存进 auth.json，保持同一行为。"
+    },
+    {
+      "name": "export-oauth-flow-lib-server",
+      "file": "codex-rs/login/src/lib.rs",
+      "anchor": "pub use server::run_login_server;",
+      "replacement": "pub use server::run_login_server;\npub use server::DEFAULT_ISSUER;\npub use server::ExchangedTokens;\npub use server::build_authorize_url;\npub use server::exchange_code_for_tokens;\npub use server::generate_state;\npub use server::obtain_api_key;\npub use server::persist_tokens_async;",
+      "occurrences": 1,
+      "why": "server 模块是私有的，re-export 上面开放的 OAuth 登录流构件给 ccodex 使用。"
+    },
+    {
+      "name": "export-oauth-flow-lib-pkce",
+      "file": "codex-rs/login/src/lib.rs",
+      "anchor": "mod pkce;",
+      "replacement": "mod pkce;\n\npub use pkce::PkceCodes;\npub use pkce::generate_pkce;",
+      "occurrences": 1,
+      "why": "pkce 模块私有但内容是 pub；re-export 让 ccodex 用官方 PKCE 生成器。"
+    }
+  ]
+}

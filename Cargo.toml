@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = ["crates/ccodex"]
+# vendor is the official workspace (codex-rs/Cargo.toml); excluding it keeps its crates'
+# workspace inheritance (edition/version.workspace = true) resolving to the official
+# root manifest.
+exclude = ["vendor"]
+
+# vendor/codex is a source copy of official openai/codex (maintained by
+# tools/sync_upstream.py) and its own workspace; it does not affect this one.
+#
+# The official workspace root's [patch.crates-io] does not propagate through
+# dependencies, so it must be mirrored here — otherwise codex-api's tungstenite resolves
+# to the crates.io original (behavior/version mismatch).
+[patch.crates-io]
+tokio-tungstenite = { git = "https://github.com/openai-oss-forks/tokio-tungstenite", rev = "0e5b2d73aa18dd9f0a50ee9ff199d5aef7594186" }
+tungstenite = { git = "https://github.com/openai-oss-forks/tungstenite-rs", rev = "4fffad30fe373adbdcffab9545e9e9bf4f2fc19f" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

@@ -1,0 +1,1 @@
+{"model":"gpt-5.6-sol","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"temperature":0.5,"max_output_tokens":100,"previous_response_id":"resp_should_be_stripped"}

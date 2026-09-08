@@ -1,0 +1,28 @@
+# 构建产物
+/target/
+/web/dist/
+/web/node_modules/
+
+# 官方源码（tools/sync_upstream.py 同步生成）
+/vendor/
+
+# 本地运行配置与状态（密钥/用量等运行时数据一律不入库）
+config.toml
+config.local.toml
+**/keys.json
+**/admin.json
+**/usage.json
+**/pricing.json
+**/proxies.json
+
+# 冒烟测试日志与临时文件
+*.log
+testdata/*.log
+/tmp/
+
+# 系统杂物
+Thumbs.db
+.DS_Store
+
+# TS 构建缓存
+*.tsbuildinfo

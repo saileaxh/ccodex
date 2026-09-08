@@ -1,0 +1,43 @@
+# ccodex 配置示例
+
+listen = "127.0.0.1:8317"
+
+# 访问密钥（sk）不再从配置文件读取：启动后打开管理面板，先设置面板登录密钥，
+# 再在「密钥」页生成 sk。旧配置里的 api_keys 会在启动时一次性迁移进 keys.json 并失效。
+# keys.json 为空 = /v1 接口开放模式（仅建议本机使用）。
+
+# 账号池目录：每个子目录一个账号，内含 auth.json（与 ~/.codex/auth.json 同格式）
+accounts_dir = "./accounts"
+
+# 出站代理（写入 HTTPS_PROXY 等环境变量，与官方客户端同一条代理路径）
+# 支持 http:// https:// socks5:// socks5h://，可内嵌认证：socks5h://user:pass@127.0.0.1:1080
+# 这是环境默认出口；管理面板「代理」页可维护命名代理池（存于 accounts_dir/../proxies.json），
+# 并按账号绑定出口
+upstream_proxy = "http://127.0.0.1:7890"
+
+[identity]
+# 对上游上报的 Codex 版本（User-Agent 与 version 头）
+# 缺省为编译时烘焙的上游版本（sync 脚本从 npm registry 解析），一般不用填
+# version = "0.153.4"
+# originator 一般不要动，默认官方 codex_cli_rs
+# originator = "codex_cli_rs"
+# UA 平台形态：
+#   "native"  —— 不覆盖任何 UA 段，走官方动态探测。Linux 部署必选：
+#               TLS 栈是 OpenSSL，UA 也是真实 Linux 形态，与官方 Linux 客户端逐字节一致
+#   "windows" —— （默认）固定 Windows 桌面指纹；仅在 Windows 主机运行时才与 TLS 栈自洽
+# ua_platform = "native"
+# UA 指纹各段显式覆盖（任何模式下都优先；一般不用动）
+# ua_os_type = "Windows"
+# ua_os_version = "10.0.26200"
+# ua_arch = "x86_64"
+# ua_terminal = "WindowsTerminal/1.21"
+
+[relay]
+# 单请求最多换号次数
+max_account_switches = 3
+# 按下游 api key 隔离派生 session-id（防多用户会话在上游关联）
+session_isolation = true
+# 请求体 zstd 压缩（官方默认开启）
+request_compression = true
+# 粘性会话 TTL（秒）
+sticky_ttl_secs = 3600

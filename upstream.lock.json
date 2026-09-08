@@ -1,0 +1,6 @@
+{
+  "repo": "https://github.com/openai/codex.git",
+  "ref": "main",
+  "commit": "1fb5158b3496a05abb89fb992d45737a02511d47",
+  "note": "commit 是实际锁定的上游提交；tools/sync_upstream.py 以此为准。升级时改这里并重新运行同步脚本。"
+}
