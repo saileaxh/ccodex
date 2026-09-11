@@ -5,7 +5,7 @@
 //! lazily at request time, so the swap must cover the request, not just construction.
 
 use crate::accounts::Account;
-use crate::proxies::{Binding, ProxyEnv, ProxyEnvGuard};
+use crate::proxies::{Binding, ProxyEnvGuard};
 use codex_http_client::{HttpClientFactory, OutboundProxyPolicy};
 use std::time::Duration;
 
@@ -24,12 +24,7 @@ pub async fn fetch_account_quotas(
         .auth()
         .await
         .ok_or_else(|| anyhow::anyhow!("凭证不可用，请重新登录"))?;
-    let mode = match &binding {
-        Binding::Default => ProxyEnv::Keep,
-        Binding::Direct => ProxyEnv::Clear,
-        Binding::Proxy { url, .. } => ProxyEnv::Set(url.clone()),
-    };
-    let _guard = ProxyEnvGuard::acquire(mode).await;
+    let _guard = ProxyEnvGuard::acquire(crate::proxies::env_mode(&binding)).await;
     // Official constructor: CF-cookie pool + auth headers (Authorization + ChatGPT-Account-Id).
     let client = codex_backend_client::Client::from_auth(
         backend_base,

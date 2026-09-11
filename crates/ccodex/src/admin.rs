@@ -162,6 +162,7 @@ pub fn router(_state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/admin/api/overview", get(handle_overview))
         .route("/admin/api/accounts", get(handle_accounts))
         .route("/admin/api/accounts/reload", post(handle_reload))
+        .route("/admin/api/accounts/{name}", delete(handle_account_remove))
         .route(
             "/admin/api/accounts/{name}/proxy",
             put(handle_account_proxy),
@@ -356,12 +357,22 @@ async fn handle_accounts(
                     })
                 })
                 .unwrap_or(Value::Null);
+            let auth_status = match a.auth_status() {
+                crate::accounts::AuthStatus::Unknown => json!({ "state": "unknown" }),
+                crate::accounts::AuthStatus::Ok => json!({ "state": "ok" }),
+                crate::accounts::AuthStatus::Invalid { reason, since_unix } => json!({
+                    "state": "invalid",
+                    "reason": reason,
+                    "since_unix": since_unix,
+                }),
+            };
             json!({
                 "name": a.name,
                 "account_id": a.account_id,
                 "email": a.account_email,
                 "plan": a.plan(),
                 "available": a.available(),
+                "auth_status": auth_status,
                 "cooldown_remaining_secs": a.cooldown_remaining().as_secs(),
                 "quotas": a.quotas(),
                 "proxy": a.proxy,
@@ -386,6 +397,48 @@ async fn handle_reload(
             tracing::warn!(error = %e, "account pool reload failed, keeping current pool");
             Ok(Json(json!({ "ok": false, "error": e.to_string() })))
         }
+    }
+}
+
+/// DELETE /admin/api/accounts/{name}: removes the account's credential dir and hot-reloads
+/// the pool. In-flight streams hold their own Arc<Account> and finish unaffected. Usage
+/// history (usage.json, keyed by name) is kept.
+async fn handle_account_remove(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<Value>, Response> {
+    authorize_admin(&state, &headers)?;
+    if name.is_empty() || name.contains(['/', '\\', '.']) {
+        return Ok(Json(json!({ "ok": false, "error": "账号名无效" })));
+    }
+    let exists = state
+        .pool
+        .read()
+        .unwrap()
+        .accounts()
+        .iter()
+        .any(|a| a.name == name);
+    if !exists {
+        return Ok(Json(
+            json!({ "ok": false, "error": format!("账号 {name} 不存在") }),
+        ));
+    }
+    let dir = state.config.accounts_dir().join(&name);
+    if let Err(e) = std::fs::remove_dir_all(&dir) {
+        tracing::warn!(account = %name, error = %e, "account dir removal failed");
+        return Ok(Json(
+            json!({ "ok": false, "error": format!("删除账号目录失败: {e}") }),
+        ));
+    }
+    match reload_pool(&state).await {
+        Ok(count) => {
+            tracing::info!(account = %name, remaining = count, "account removed, pool reloaded");
+            Ok(Json(json!({ "ok": true, "accounts": count })))
+        }
+        Err(e) => Ok(Json(
+            json!({ "ok": false, "error": format!("目录已删除，但重载失败: {e}") }),
+        )),
     }
 }
 
@@ -627,6 +680,8 @@ fn valid_account_name(body: &Value) -> Result<String, String> {
 
 /// POST /admin/api/accounts/oauth-login {name}: browser OAuth flow (official codex login
 /// shape). Returns the authorize URL; completion is the paste-back endpoint below.
+/// Passing an existing account name re-auths that account in place (completion rewrites
+/// its auth.json and the reload rebuilds it, clearing any invalid state).
 async fn handle_oauth_login_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -686,7 +741,7 @@ async fn handle_oauth_login_complete(
 }
 
 /// Starts a device-code login: returns display info immediately; polling runs in a
-/// background task.
+/// background task. Like oauth-login, an existing name re-auths that account in place.
 async fn handle_device_login_start(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,

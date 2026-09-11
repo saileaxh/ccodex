@@ -134,6 +134,10 @@ async fn handle_create(
         &state.sessions,
         state.config.max_account_switches(),
         state.config.request_compression(),
+        // WS frames carry no per-turn x-codex-turn-metadata header; a compaction_trigger
+        // item still flips request_kind via the built-in default compaction block.
+        None,
+        &state.telemetry,
     )
     .await;
 
@@ -141,15 +145,36 @@ async fn handle_create(
         Ok(ForwardResult::Stream(stream)) => {
             let upstream = *stream;
             let account = upstream.account_name.clone();
+            let telem_session = upstream.session.clone();
+            let telem = upstream.telem;
+            let model = body
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             let mut tap = crate::sse_tap::SseTap::new();
+            // 该账号自己的 metrics client（与 analytics 同账号出口）
+            let tap_metrics = {
+                let pool = state.pool.read().unwrap();
+                state.telemetry.metrics_for_name(&pool, &account)
+            };
             let mut bytes = upstream.bytes;
             let mut buf: Vec<u8> = Vec::new();
             while let Some(chunk) = bytes.next().await {
                 let Ok(b) = chunk else {
+                    tap.note_stream_error();
+                    let events = std::mem::take(&mut tap.metric_events);
+                    if let Some(metrics) = &tap_metrics {
+                        state.telemetry.metrics.sse_events(metrics, &model, &events);
+                    }
                     let _ = send_error(socket, "stream_error", "upstream stream interrupted").await;
                     return true;
                 };
                 tap.feed(&b);
+                let events = std::mem::take(&mut tap.metric_events);
+                if let Some(metrics) = &tap_metrics {
+                    state.telemetry.metrics.sse_events(metrics, &model, &events);
+                }
                 buf.extend_from_slice(&b);
                 // SSE events are blank-line separated; extract each data payload as a WS frame.
                 while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
@@ -169,6 +194,50 @@ async fn handle_create(
                         }
                     }
                 }
+            }
+            // Stream tail: same turn-tracker finalization as the HTTP path.
+            let pool_snapshot = state.pool.read().unwrap().clone();
+            match telem {
+                crate::forward::AttemptTelem::Turn { session_key, .. } => {
+                    let emissions = state.telemetry.tracker.note_response_end(
+                        &session_key,
+                        &account,
+                        &tap,
+                    );
+                    state
+                        .telemetry
+                        .emit_for_account_name(&pool_snapshot, &account, emissions);
+                }
+                crate::forward::AttemptTelem::Compaction(start) => {
+                    let (status, failure) = if tap.completed {
+                        ("completed", None)
+                    } else {
+                        (
+                            "failed",
+                            Some(crate::turns::failure_from_stream_error(tap.failed.as_ref())),
+                        )
+                    };
+                    let usage = tap.usage.as_ref().map(crate::turns::TokenAccum::from_wire);
+                    let emissions = state.telemetry.tracker.note_compaction_end(
+                        &telem_session,
+                        &account,
+                        &start,
+                        &crate::request_build::default_compaction_metadata(
+                            "responses_compaction_v2",
+                        ),
+                        "responses_compaction_v2",
+                        &model,
+                        crate::turns::CompactionOutcome {
+                            status,
+                            failure,
+                            usage,
+                        },
+                    );
+                    state
+                        .telemetry
+                        .emit_for_account_name(&pool_snapshot, &account, emissions);
+                }
+                crate::forward::AttemptTelem::None => {}
             }
             tracing::info!(
                 account = %account,
@@ -202,6 +271,13 @@ async fn handle_create(
             socket,
             "model_cooldown",
             "all upstream accounts are cooling down",
+        )
+        .await
+        .is_ok(),
+        Err(RelayError::AllAccountsInvalid) => send_error(
+            socket,
+            "accounts_invalid",
+            "all upstream account credentials were revoked; re-login or remove them in the admin panel",
         )
         .await
         .is_ok(),

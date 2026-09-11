@@ -20,6 +20,7 @@
 | session-id / thread-id / x-client-request-id | request_build | **v7 UUID**（与官方 SessionId/ThreadId::new 同版本），同下游会话稳定复用 |
 | x-codex-window-id | request_build | `{thread_id}:0`（官方主窗口格式） |
 | x-codex-turn-metadata | request_build | 官方 CodexTurnMetadataPayload 全字段（见下） |
+| x-codex-routing-hint | request_build | `model=<slug>`（官方 build_routing_hint_header：codex 后端恒发；service_tier 默认 None 故无 `;tier=` 后缀） |
 | x-openai-internal-codex-responses-lite | request_build | 仅 lite 模型 |
 | accept / content-encoding | forward | text/event-stream / zstd（官方默认开启压缩） |
 
@@ -55,9 +56,36 @@
   agent_name="root"、turn_id、window_id/window_number=0、request_kind="turn"、
   thread_source="user"、sandbox="none"、sandbox_mode="read-only"（Windows 默认配置）、
   auto_review_enabled=false、node_repl_*（随模型）、turn_started_at_unix_ms。
+  输入含 compaction_trigger 项时按官方换 request_kind="compaction" 并在末尾附
+  compaction 块（逐字复制下游头里的值，见 Compact 节）。
 - **item 规范化**：无前缀 item id 丢弃（官方 prepare_response_items_for_request）；
   无前缀保留规则 = `prefix_suffix` 双非空。
 - 下游专有字段（temperature/max_output_tokens/previous_response_id/metadata 等）全部剥离。
+
+### Compact（上下文压缩，两条官方路径）
+官方 0.153.4 在 ChatGPT 后端（RemoteCompactionSupport::V2）+ 默认配置
+（`features.remote_compaction_v2` Stable 默认开启）下走 **v2**；legacy 端点仅当
+用户显式关闭该 feature。
+
+- **v2（默认路径，走 /responses）**：下游在 input 末尾追加 `{"type":"compaction_trigger"}`
+  项，turn metadata 换 `request_kind:"compaction"` + CompactionTurnMetadata 块
+  （trigger/reason/implementation/phase/strategy 全 snake_case）。中继行为：input 项
+  原样保留（item 规范化不触碰无 id 项）；检测到 trigger 项即换 request_kind，并**逐字复制
+  下游 x-codex-turn-metadata 头里的 compaction 块**（操作遥测而非身份，官方客户端恒携带；
+  缺失时回退 manual/user_requested/standalone_turn/memento 默认块）。已实测端到端：
+  上游返回 `compaction` 输出项 + 逐项 usage 归因（cmp_* 条目），SSE 逐字节透传。
+- **legacy `/responses/compact`**（codex-api CompactClient，unary 纯 JSON，不压缩、无
+  Accept 覆盖）：body 按官方 `CompactionInput` 结构体序重建（model/input/instructions/
+  tools/parallel_tool_calls/reasoning/service_tier/prompt_cache_key/text/access_programs；
+  instructions/tools 恒顶层——lite 不做前缀项转换；prompt_cache_key 重写为按账号
+  session_id；item 仅剥无前缀 id）。头按官方 compact_conversation_history 集合：
+  **session-id + thread-id 双头（无 x-client-request-id）**、x-codex-installation-id
+  （此路径是真实 HTTP 头，非 client_metadata）、x-codex-window-id、x-codex-turn-metadata
+  （request_kind:"compaction"）、x-codex-routing-hint、lite 头；x-codex-turn-state
+  按中继策略剥离（同 /responses）。响应镜像含 x-codex-turn-state 头。
+  **上游现状（2026-09，账号 #1）**：该端点 404 `{"detail":"Not Found"}`——官方旧式
+  客户端打真实后端同样 404，属上游端点退役/未开放，中继如实镜像，非中继缺陷。
+  本地 mock 冒烟（verify_compact.py）逐字段覆盖上述形状。
 
 ### GET /models
 只发 `client_version=<身份版本>` query（官方 client_version_to_whole），
@@ -125,9 +153,86 @@
 | Linux 构建的 OpenSSL 次版本随构建机 | 官方 release 用其 CI 的 OpenSSL | cipher/扩展集合可能有细微差别；同在 OpenSSL 家族内，属官方 Linux 用户群体正常离散度。可用与官方 CI 相近的发行版构建进一步收窄 |
 | /models、/v1/models 走缓存直出（内嵌官方 models.json 兜底 + 后台 60s 拉取、1h 刷新） | 官方 ModelsClient 请求路径 5s 超时（MODELS_REFRESH_TIMEOUT）实时透传 | 上游清单 ~260KB 且 CF 不压缩，高延迟代理链路上实测 20-28s，5s 必然 504；后台刷新请求形状与官方完全一致（`/models?client_version=<版本>` + 账号 auth/transport），仅时效性改为至多小时级。官方 CLI 自身也缓存模型清单。形状分工：`/models`、`/backend-api/codex/models` 下行字节即上游字节（codex 形状）；`/v1/models` 将同一份缓存转为 OpenAI `{"object":"list","data":[{"id"}]}` 形状并过滤 `visibility:"hide"`，服务 cc-switch 等 OpenAI 兼容工具（纯下行表示层转换，上游不可见） |
 
-## 四、残余关注点（升级上游时复查）
+## 四、遥测通道（官方 analytics events + Statsig metrics）
+
+官方客户端对 ChatGPT 鉴权恒发两条遥测：`codex-analytics` 的三类事件（thread/turn/compaction）
+与 `codex-otel` 的 Statsig OTLP 指标。两者都是上游可观察量（域名、形状、节奏、数值自洽性），
+缺失或伪造都是特征。中继按**同一语义、同一形状、同一通道**实现。
+
+**总原则（与 PR #666 的分野）：所有数值来自真实中转流量或官方默认配置，绝不编造。**
+事件由真实请求驱动，usage 取自线上字节，token/时序/工具计数全部实测；
+上游看不见的配置值按官方默认取（见下表）。伪造或自相矛盾的遥测比不发更糟。
+
+### analytics events（`{chatgpt_base}/codex/analytics-events/events`）
+
+- **通道**：每账号一条 `mpsc(256)` 队列 + 独立 worker（对齐官方 AnalyticsEventsQueue：
+  `try_send`，满则 warn 丢弃不阻塞业务）；每个事件一次 POST；发送前重读该账号
+  `auth_manager.auth()`；api-key / 非 codex 后端鉴权直接丢弃；10s 超时；
+  非 2xx 或网络错误 warn 后不重试（官方同）。
+- **鉴权头**：`auth_provider_from_auth(auth).to_auth_headers()`——与官方同一函数
+  （Bearer access_token + chatgpt-account-id），账号切换/刷新自动跟随。
+- **形状**：`TrackEventsRequest{events:[{event_type, event_params}]}`；字段顺序、可空字段
+  （官方三类事件无 `skip_serializing_if`，null 照发）、嵌套 metadata 全部按官方
+  `analytics/src/events.rs` 声明顺序逐字段对齐（62 字段 turn / 12 字段 thread init /
+  25 字段 compaction）。`crates/ccodex/src/analytics.rs` 为逐字段镜像，
+  `testdata/verify_telemetry.py` 用真实流量断言字段顺序与取值（e2e 42 项全绿）。
+- **语义重建**（官方值在 wire 上不可见的部分，全部有据可查）：
+
+| 字段 | 重建方式 |
+|---|---|
+| turn 边界 | 请求 input 尾部的 tool-output `call_id` ⊆ 当前 turn 待答 call_id 集合 → 同一 turn 的下一 sampling（同 turn_id、`sampling_request_count++`、间隔计入 `tool_blocking_ms`）；失败后同 input 重发 → 官方 retry（同 turn、`sampling_retry_count++`）；否则旧 turn 结账、新 turn 开张。**该重建同时修正了数据面偏差：同 turn 的多次 sampling 现在复用同一 turn_id**（此前每请求新 id） |
+| 失败 turn 结账 | 官方在 turn 结束瞬间上报；中继无法预知下游是否重试，故保留 5s 重试宽限（官方 4 次退避重试都在 ~3s 内），宽限内同 input 请求续接同一 turn，逾期由 1s 心跳 sweep 以 `status="failed"` 结账 |
+| `reasoning_effort` / `reasoning_summary` | 官方上报用户**配置值**（wire 不可见）。显式值解析后与模型默认解析值不同 → 上报显式原值；相同 → effort 报 null、summary 报 `"auto"`（= 未配置的官方客户端） |
+| 时序桶 | `before_first_sampling_ms=0`（分类即派发）、`sampling_ms=Σ(派发→流 EOF)`、`tool_blocking_ms=续接间隔`、`between_sampling_overhead_ms` / `after_last_sampling_ms=0` |
+| compaction | 官方 compact 任务只发 compaction 事件、**不发 turn 事件**（中继同）；v2（/responses 带 `compaction_trigger` 或下游 turn metadata）→ `responses_compaction_v2`；legacy（/responses/compact）→ `responses_compact`；trigger/reason/phase/strategy 优先取下游 `x-codex-turn-metadata`，缺省 manual/user_requested/standalone_turn/memento（与官方 compact_remote 调用点一致） |
+| 计数 | 按官方 `TurnToolCounts` 分桶（shell/file_change/mcp/dynamic/subagent/web_search/image_generation + total）；只统计**已声明**工具名（未声明名字不计入 total，对齐官方 tool-error 路径）；subagent 按 call_id 去重 |
+
+- **上游不可见字段取官方默认**（与"未改配置的官方客户端"逐值一致）：
+  `model_provider="openai"`、`sandbox_policy="read_only"`、`service_tier="default"`、
+  `approval_policy="on-request"`、`approvals_reviewer="user"`、`collaboration_mode="default"`、
+  `thread_source="user"`、`initialization_mode="new"`、`steer_count=0`、
+  `num_input_images`=下行尾随 user message 的 `input_image` 计数、`guardian_v2_enabled=false`、
+  `sandbox_network_access=false`、`ephemeral=false`、`image_preparations=[]`。
+- **匿名请求**（无任何会话标识）：一次性 thread——thread_init + turn 事件各一，与官方
+  单次 exec 形态一致，不跨请求复用。
+
+### Statsig metrics（`ab.chatgpt.com/otlp/v1/metrics`）
+
+直接复用官方 `codex-otel` crate：`MetricsClient` + `OtlpHttp` 导出器 + Delta temporality +
+PeriodicReader（默认 60s）+ meter `codex` + resource（`service.name`/`service.version`/
+`env`/`os`/`os_version`）+ 内置 Statsig key——与官方二进制同一代码路径、同一 endpoint。
+指标集（Statsig 可见集，官方 STATSIG_DISABLED_METRICS 内的指标我们本就不发）：
+
+| 指标 | 触发 | 标签 |
+|---|---|---|
+| `codex.process.start` | 进程启动一次 | originator |
+| `codex.thread.started` | 每个 thread_init | is_git=false + metadata |
+| `codex.sse_event` / `.duration_ms` | 每个上游 SSE 事件 | kind（event: 行原文）/ success / 与上一事件间隔 |
+| `codex.turn.ttft` / `ttfm` / `e2e_duration_ms` | turn 结账 | metadata |
+| `codex.turn.tool.call` | turn 结账 | tmp_mem_enabled=false + metadata |
+| `codex.turn.network_proxy` / `memory` / `unified_exec.running_processes` | turn 结账 | 官方默认配置值（不启用） |
+| `codex.task.compact` | 每次 compaction | type（remote_v2/remote/local）+ manual |
+
+metadata 标签顺序与官方 `into_tags` 一致：`auth_mode=Chatgpt`、`session_source=cli`、
+`originator=codex_cli_rs`、`model`、`app.version`。
+
+### 刻意偏差（全部为"少发/降级"，不伪造）
+
+| 偏差 | 官方行为 | 理由 |
+|---|---|---|
+| 遥测出口走进程级 env 代理（配置项 `upstream_proxy` 写入 `HTTPS_PROXY`/`ALL_PROXY`，reqwest 系统代理解析），不按账号绑定代理 | 官方单进程单账号、直连出网，无所谓 | 事件仍按各账号自己的 token 鉴权与归属；出口 IP 与数据面一致 |
+| 常驻进程按 60s 周期导出、analytics 队列长驻 | 官方 CLI 进程生命周期短，退出前未必导出 | 事件只多不少且全部来自真实流量；对端看到的是"一个长会话客户端" |
+| v2 compaction 的 `retained_image_count` 恒 null | 官方为真实保留图片数 | 上游不返回该信息，不猜 |
+| legacy compact 的 `active_context_tokens_after` = 累计 + 响应 `usage.total` 近似 | 官方压缩后重算的真实上下文 | 唯一可得的上界估计，取值来源真实、方向保守 |
+| 不发插件/skill/feature.state 事件 | 官方启用插件/技能时发 | 中继无插件系统；默认配置的官方客户端同样不发 |
+| 无遥测开关 | 官方对 ChatGPT 鉴权恒开 | 保持一致；不想发即等于不像官方客户端 |
+
+## 五、残余关注点（升级上游时复查）
 
 1. models.json 行为字段变化 → `model_db.rs` 字段集需同步（sync 脚本 + 单测兜底）。
 2. `CodexTurnMetadataPayload` 增删字段 → `build_turn_metadata` 需跟进（锚定补丁失效会阻断构建的是 vendor 侧，payload 是我们自有代码，需人工对照）。
 3. WS 上行是否成为强制（届时接入官方 ResponsesWebsocketClient）。
 4. `x-codex-turn-state` 语义变化（当前官方 HTTP 首轮恒无）。
+5. 遥测事件结构体增删字段 → `analytics.rs` 镜像需同步（官方 events.rs 声明序）；
+   `testdata/verify_telemetry.py` 的字段序断言会直接失败，是这套同步的哨兵。
+6. 官方新增遥测通道（新事件类型 / 新指标）→ 复查是否属"真实流量可驱动"的一类。

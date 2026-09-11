@@ -1,18 +1,22 @@
 mod accounts;
 mod admin;
 mod admin_auth;
+mod analytics;
 mod config;
 mod forward;
 mod gateway;
 mod identity;
 mod keys;
 mod login;
+mod metrics;
 mod model_db;
 mod pricing;
 mod proxies;
 mod quota;
 mod request_build;
 mod sse_tap;
+mod telemetry;
+mod turns;
 mod usage;
 mod web;
 mod ws;
@@ -173,8 +177,10 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
         OutboundProxyPolicy::ReqwestDefault,
     ));
-    let proxy_store =
-        proxies::ProxyStore::load(&proxies::ProxyStore::path_for(&config.accounts_dir()));
+    // Shared with the telemetry channels, which resolve each account's binding per send.
+    let proxy_store = std::sync::Arc::new(proxies::ProxyStore::load(
+        &proxies::ProxyStore::path_for(&config.accounts_dir()),
+    ));
     let key_store = keys::KeyStore::load(&keys::KeyStore::path_for(&config.accounts_dir()));
     // One-time migration: legacy config.toml api_keys move into the managed store
     // (fingerprint-named, idempotent). Config is no longer an auth source afterwards.
@@ -217,7 +223,7 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         pool: std::sync::RwLock::new(pool),
         provider,
         route,
-        proxies: proxy_store,
+        proxies: proxy_store.clone(),
         keys: key_store,
         admin_auth,
         usage: usage_store,
@@ -226,6 +232,7 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         logins: std::sync::Mutex::new(std::collections::HashMap::new()),
         oauth_logins: std::sync::Mutex::new(std::collections::HashMap::new()),
         sessions: request_build::SessionStore::new(Duration::from_secs(24 * 3600)),
+        telemetry: std::sync::Arc::new(telemetry::Telemetry::new(proxy_store.clone())),
         // Seeded with the embedded official models.json so /v1/models answers instantly
         // from the first request; the background task upgrades it to live upstream bytes.
         models_cache: std::sync::RwLock::new(Some(gateway::CachedModels {
@@ -235,6 +242,10 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
         })),
     });
     gateway::spawn_models_refresh(Arc::clone(&state));
+    telemetry::Telemetry::spawn_sweep(&state.telemetry, {
+        let state = Arc::clone(&state);
+        move || state.pool.read().unwrap().clone()
+    });
 
     let listen = state.config.listen().to_string();
     let addr: SocketAddr = listen

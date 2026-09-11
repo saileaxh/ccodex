@@ -40,8 +40,8 @@ function CopyButton({ text }: { text: string }) {
   );
 }
 
-function OAuthCard({ onDone }: { onDone: () => void }) {
-  const [name, setName] = useState("");
+function OAuthCard({ initialName, onDone }: { initialName: string; onDone: () => void }) {
+  const [name, setName] = useState(initialName);
   const [step, setStep] = useState<OAuthStep>({ kind: "input" });
   const [pasted, setPasted] = useState("");
   const [submitting, setSubmitting] = useState(false);
@@ -182,8 +182,8 @@ function OAuthCard({ onDone }: { onDone: () => void }) {
   );
 }
 
-function DeviceCard({ onDone }: { onDone: () => void }) {
-  const [name, setName] = useState("");
+function DeviceCard({ initialName, onDone }: { initialName: string; onDone: () => void }) {
+  const [name, setName] = useState(initialName);
   const [step, setStep] = useState<DeviceStep>({ kind: "idle" });
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -318,12 +318,17 @@ function DeviceCard({ onDone }: { onDone: () => void }) {
   );
 }
 
-export default function AddAccountPage({ onDone }: { onDone: () => void }) {
+export default function AddAccountPage({ initialName = "", onDone }: { initialName?: string; onDone: () => void }) {
   return (
     <div className="space-y-6">
-      <h1 className="text-2xl font-semibold tracking-tight">添加账号</h1>
-      <OAuthCard onDone={onDone} />
-      <DeviceCard onDone={onDone} />
+      <h1 className="text-2xl font-semibold tracking-tight">{initialName ? "重新登录" : "添加账号"}</h1>
+      {initialName && (
+        <p className="text-sm text-muted-foreground">
+          将为账号 <span className="font-medium text-foreground">{initialName}</span> 重新写入凭证（同名覆盖，完成后账号池自动热重载，失效状态自动清除）。
+        </p>
+      )}
+      <OAuthCard initialName={initialName} onDone={onDone} />
+      <DeviceCard initialName={initialName} onDone={onDone} />
     </div>
   );
 }

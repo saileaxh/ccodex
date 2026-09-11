@@ -37,6 +37,12 @@ class Handler(BaseHTTPRequestHandler):
                 )
         except Exception as e:  # noqa: BLE001
             record["body_decode_error"] = str(e)
+        # 未压缩的 JSON 体直接解析（如 alpha/search 官方默认不压缩）
+        if "body_json" not in record and body:
+            try:
+                record["body_json"] = json.loads(body)
+            except Exception:  # noqa: BLE001
+                pass
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
@@ -47,6 +53,49 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("content-type", "text/event-stream")
             self.send_header("x-codex-primary-used-percent", "23")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/alpha/search":
+            payload = json.dumps(
+                {
+                    "encrypted_output": "ciphertext",
+                    "output": "Search result",
+                    "results": [
+                        {
+                            "type": "text_result",
+                            "ref_id": "turn0search0",
+                            "url": "https://example.com/search-result",
+                            "title": "Search Result",
+                            "snippet": "A result snippet",
+                        }
+                    ],
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("x-codex-primary-used-percent", "23")
+            self.send_header("content-length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        elif self.path == "/responses/compact":
+            payload = json.dumps(
+                {
+                    "output": [
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [
+                                {"type": "output_text", "text": "compacted summary"}
+                            ],
+                        }
+                    ]
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("x-codex-primary-used-percent", "23")
+            self.send_header("x-codex-turn-state", "mock-turn-state-1")
             self.send_header("content-length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)

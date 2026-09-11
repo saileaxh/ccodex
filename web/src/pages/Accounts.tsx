@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { RefreshCw } from "lucide-react";
+import { LogIn, RefreshCw, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -102,7 +102,40 @@ function formatCooldown(secs: number): string {
   return `${Math.floor(secs / 3600)}h${Math.floor((secs % 3600) / 60)}m`;
 }
 
-export default function AccountsPage() {
+function formatUnix(unix: number): string {
+  const d = new Date(unix * 1000);
+  const mm = `${d.getMinutes()}`.padStart(2, "0");
+  const hh = `${d.getHours()}`.padStart(2, "0");
+  return `${d.getMonth() + 1}-${d.getDate()} ${hh}:${mm}`;
+}
+
+/** 状态列：凭证失效（红，附原因）> 冷却中 > 可用 > 待验证（加载后尚无流量裁决） */
+function StatusCell({ acc }: { acc: AccountInfo }) {
+  const st = acc.auth_status?.state ?? "unknown";
+  return (
+    <div className="space-y-1">
+      <div>
+        {st === "invalid" ? (
+          <Badge variant="destructive">凭证失效</Badge>
+        ) : !acc.available ? (
+          <Badge variant="secondary">冷却中</Badge>
+        ) : st === "ok" ? (
+          <Badge variant="success">可用</Badge>
+        ) : (
+          <Badge variant="outline">待验证</Badge>
+        )}
+      </div>
+      {st === "invalid" && (
+        <div className="text-[10px] text-destructive/80 max-w-60">
+          {acc.auth_status?.since_unix ? `${formatUnix(acc.auth_status.since_unix)} · ` : ""}
+          {acc.auth_status?.reason ?? "上游拒绝了该账号凭证"}
+        </div>
+      )}
+    </div>
+  );
+}
+
+export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) => void }) {
   const [accounts, setAccounts] = useState<AccountInfo[] | null>(null);
   const [proxies, setProxies] = useState<ProxyInfo[]>([]);
   const [error, setError] = useState("");
@@ -170,6 +203,28 @@ export default function AccountsPage() {
     }
   };
 
+  const remove = async (acc: AccountInfo) => {
+    if (
+      !window.confirm(
+        `删除账号「${acc.name}」？其凭证目录将被移除，使用该账号的请求立即失败（历史用量统计保留）。`
+      )
+    )
+      return;
+    setNotice("");
+    setError("");
+    try {
+      const r = await api.removeAccount(acc.name);
+      if (r.ok) {
+        setNotice(`已删除 ${acc.name}，剩余 ${r.accounts ?? "?"} 个账号`);
+        load();
+      } else {
+        setError(r.error ?? "删除失败");
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <div className="space-y-6">
       <div className="flex items-center justify-between">
@@ -196,6 +251,7 @@ export default function AccountsPage() {
                 <TableHead>冷却剩余</TableHead>
                 <TableHead>出口代理</TableHead>
                 <TableHead>上游配额</TableHead>
+                <TableHead>操作</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -213,9 +269,7 @@ export default function AccountsPage() {
                     )}
                   </TableCell>
                   <TableCell>
-                    <Badge variant={acc.available ? "success" : "destructive"}>
-                      {acc.available ? "可用" : "冷却中"}
-                    </Badge>
+                    <StatusCell acc={acc} />
                   </TableCell>
                   <TableCell>{formatCooldown(acc.cooldown_remaining_secs)}</TableCell>
                   <TableCell>
@@ -241,18 +295,43 @@ export default function AccountsPage() {
                       onRefresh={() => refreshQuota(acc.name)}
                     />
                   </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-1">
+                      {acc.auth_status?.state === "invalid" && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          title="用同一账号名重新登录，覆盖已失效的凭证"
+                          onClick={() => onRelogin(acc.name)}
+                        >
+                          <LogIn className="h-3.5 w-3.5 mr-1" />
+                          重新登录
+                        </Button>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                        title="删除账号（凭证目录移除，用量统计保留）"
+                        onClick={() => remove(acc)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </TableCell>
                 </TableRow>
               ))}
               {accounts && accounts.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                  <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
                     暂无账号，请到「添加账号」页登录
                   </TableCell>
                 </TableRow>
               )}
               {!accounts && (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-muted-foreground py-8">
+                  <TableCell colSpan={7} className="text-center text-muted-foreground py-8">
                     加载中…
                   </TableCell>
                 </TableRow>

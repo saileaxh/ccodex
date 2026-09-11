@@ -28,6 +28,13 @@ export default function App() {
   const [setupRequired, setSetupRequired] = useState<boolean | undefined>(undefined);
   const [authed, setAuthed] = useState(() => !!getApiKey());
   const [tab, setTab] = useState<Tab>("overview");
+  // 「账号」页点「重新登录」时预填到「添加账号」页的账号名（重新登录 = 同名覆盖凭证）
+  const [reloginName, setReloginName] = useState("");
+
+  const startRelogin = (name: string) => {
+    setReloginName(name);
+    setTab("add-account");
+  };
 
   useEffect(() => {
     api
@@ -81,7 +88,10 @@ export default function App() {
           {TABS.map(({ key, label, icon: Icon }) => (
             <button
               key={key}
-              onClick={() => setTab(key)}
+              onClick={() => {
+                setReloginName(""); // 手动导航清掉「重新登录」预填
+                setTab(key);
+              }}
               className={`w-full flex items-center gap-2.5 rounded-md px-3 py-2 text-sm transition-colors ${
                 tab === key
                   ? "bg-accent text-accent-foreground font-medium"
@@ -102,12 +112,12 @@ export default function App() {
       </aside>
       <main className="flex-1 p-6 max-w-5xl">
         {tab === "overview" && <OverviewPage />}
-        {tab === "accounts" && <AccountsPage />}
+        {tab === "accounts" && <AccountsPage onRelogin={startRelogin} />}
         {tab === "keys" && <KeysPage />}
         {tab === "cost" && <CostPage />}
         {tab === "proxies" && <ProxiesPage />}
         {tab === "endpoints" && <EndpointsPage />}
-        {tab === "add-account" && <AddAccountPage onDone={() => setTab("accounts")} />}
+        {tab === "add-account" && <AddAccountPage initialName={reloginName} onDone={() => setTab("accounts")} />}
       </main>
     </div>
   );

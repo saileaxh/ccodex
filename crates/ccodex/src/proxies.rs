@@ -5,7 +5,6 @@
 //! upstream_proxy). Note: token-refresh clients are rebuilt by the official AuthManager at
 //! refresh time and therefore follow the ambient default, not the account binding.
 
-use codex_http_client::ReqwestTransport;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -351,15 +350,29 @@ impl Drop for ProxyEnvGuard {
     }
 }
 
-/// Builds the official default client with `proxy` injected into the env vars reqwest's
-/// system-proxy logic reads at ClientBuilder::build (Some: set, None: remove = direct).
-pub async fn build_official_client(proxy: Option<&str>) -> ReqwestTransport {
-    let mode = match proxy {
-        Some(url) => ProxyEnv::Set(url.to_string()),
-        None => ProxyEnv::Clear,
-    };
-    let _guard = ProxyEnvGuard::acquire(mode).await;
-    ReqwestTransport::from_http_client(codex_login::default_client::create_client())
+/// The env-swap mode for one account binding — the single mapping shared by every path
+/// that must egress like the account: the data-plane transport, quota fetches, and both
+/// telemetry channels (analytics events + Statsig OTLP metrics).
+pub fn env_mode(binding: &Binding) -> ProxyEnv {
+    match binding {
+        Binding::Default => ProxyEnv::Keep,
+        Binding::Direct => ProxyEnv::Clear,
+        Binding::Proxy { url, .. } => ProxyEnv::Set(url.clone()),
+    }
+}
+
+/// Builds official clients that bake in the process proxy env at `ClientBuilder::build`
+/// time — reqwest's system-proxy logic resolves the ambient env exactly then. The env is
+/// swapped to this account's binding for the duration of `build`, then restored.
+///
+/// The official client builder itself is untouched: this is the same construction path as
+/// the official binary, only the ambient proxy differs — which is precisely how the
+/// official client picks its own proxy. Every client an account talks through (data plane
+/// and telemetry alike) must be built in here, so nothing egresses from a different IP
+/// than the conversation it belongs to.
+pub async fn with_binding<T>(binding: &Binding, build: impl FnOnce() -> T) -> T {
+    let _guard = ProxyEnvGuard::acquire(env_mode(binding)).await;
+    build()
 }
 
 #[cfg(test)]

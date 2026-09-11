@@ -93,14 +93,17 @@ env_key = "OPENAI_API_KEY"   # 值填面板「密钥」页生成的 sk- 访问�
 | `GET /v1/responses`、`/backend-api/codex/responses`（WS upgrade） | 官方 WS 协议：收 `{"type":"response.create",…}` 帧，事件帧逐字节回发；连接可复用 |
 | `GET /models`、`/backend-api/codex/models` | 模型清单，codex 形状 `{"models":[…]}`，供 Codex CLI（缓存直出：内嵌官方 models.json 兜底 + 后台 60s 超时拉取/1h 刷新；官方 5s 交互超时在高延迟链路上不可取，见 [docs/AUDIT.md](docs/AUDIT.md) 偏差登记） |
 | `GET /v1/models` | 同一份缓存转为 OpenAI 形状 `{"object":"list","data":[{"id",…}]}`（`visibility:"hide"` 条目过滤），供 cc-switch 等 OpenAI 兼容工具 |
+| `POST /alpha/search`、`/v1/alpha/search`、`/backend-api/codex/alpha/search` | 官方 standalone web search 执行通道（SearchClient → `{provider}/alpha/search`）：下游官方客户端执行模型 web.run 调用的入口；body 除 `id` 换为按账号会话 id 外原样透传，普通 JSON 镜像返回 |
+| `POST /responses/compact`、`/v1/responses/compact`、`/backend-api/codex/responses/compact` | 官方 legacy 远程压缩通道（CompactClient → `{provider}/responses/compact`）：body 按官方 CompactionInput 形状重建（字段序/identity 字段按账号重写），unary JSON 镜像返回。**注意**：0.153.4 官方默认走 v2 压缩（见下），该端点上游已对我们账号 404，仅服务 `remote_compaction_v2=false` 的旧式客户端且行为与官方一致地镜像上游拒绝 |
 | `GET /health` | 健康检查（账号数/上游 commit/身份版本） |
 | `GET /` | 管理面板（内嵌静态资源，SPA 回退） |
 | `GET /admin/api/auth-status` | 面板登录密钥状态（开放端点：`setup_required`） |
 | `POST /admin/api/admin-key` `{current?, new}` | 设置/修改面板登录密钥（未设置时开放=首次强制设置；已设置需带当前密钥；不得与任一 sk 相同） |
 | `GET /admin/api/overview` | 概览 |
-| `GET /admin/api/accounts` | 账号列表（状态/冷却/email/套餐/上游配额快照/出口代理绑定/周期用量） |
+| `GET /admin/api/accounts` | 账号列表（凭证状态/冷却/email/套餐/上游配额快照/出口代理绑定/周期用量） |
 | `POST /admin/api/accounts/reload` | 热重载账号池 |
-| `POST /admin/api/accounts/oauth-login` `{name}` | 发起浏览器 OAuth 登录 → `{session_id, authorize_url}`（推荐） |
+| `DELETE /admin/api/accounts/{name}` | 删除账号（移除凭证目录并热重载；在途流不受影响；用量统计保留） |
+| `POST /admin/api/accounts/oauth-login` `{name}` | 发起浏览器 OAuth 登录 → `{session_id, authorize_url}`（推荐；填已有账号名=重新登录覆盖凭证） |
 | `POST /admin/api/accounts/oauth-login/{id}/complete` `{redirect_url}` | 粘贴回跳的 localhost:1455 URL 完成登录（成功后自动热重载） |
 | `POST /admin/api/accounts/device-login` `{name}` | 发起设备码登录（备用，更易触发风控）→ `{session_id, verification_url, user_code}` |
 | `GET /admin/api/accounts/device-login/{id}` | 轮询登录状态 `pending/done/error`（done 后自动热重载） |
@@ -172,7 +175,8 @@ reasoning/verbosity 等）。完整审计（含刻意偏差及理由）见 [docs
 - `originator: codex_cli_rs` + `User-Agent: codex_cli_rs/<version> (<OS>; <arch>) <terminal>`（官方代码生成；`identity.ua_platform = "native"` 时与官方一样动态探测本机，Linux 部署必选以与 OpenSSL 栈自洽；默认 `windows` 为固定 Windows 指纹）
 - `version` 头与 UA 同版本
 - `session-id` / `thread-id` / `x-client-request-id`：**v7 UUID**（与官方 `SessionId/ThreadId::new` 同版本），同下游会话稳定复用、多用户互不关联
-- `x-codex-window-id: {thread_id}:0` + `x-codex-turn-metadata` 头（官方 CodexTurnMetadataPayload 全字段）
+- `x-codex-window-id: {thread_id}:0` + `x-codex-turn-metadata` 头（官方 CodexTurnMetadataPayload 全字段；输入含 compaction_trigger 项时按官方换 `request_kind:"compaction"` 并附下游自带的 CompactionTurnMetadata 块）
+- `x-codex-routing-hint: model=<slug>`（官方 codex 后端必发；配置了 service_tier 时官方会追加 `;tier=<tier>`，本中继按官方默认省略 tier）
 - 默认**不发** `x-codex-beta-features` / `x-codex-turn-state` / `conversation_id` / traceparent 等（对齐官方默认配置首轮行为）
 - `Accept: text/event-stream`，请求体 `Content-Encoding: zstd`（官方默认开启压缩）
 - 请求体字段集合与顺序 = 官方 `ResponsesApiRequest` 结构体序；`store:false`、`stream:true`、
@@ -194,6 +198,28 @@ reasoning/verbosity 等）。完整审计（含刻意偏差及理由）见 [docs
 - WS 下行：上行始终走官方 HTTP SSE 路径（官方客户端在 WS 不可用时的同款回退行为，
   请求构造共享同一代码），事件内容原样转发，不做解析/重序列化
 
+## 遥测（与官方客户端一致）
+
+官方客户端对 ChatGPT 鉴权恒发两条遥测，中继同语义同形状实现，**全部由真实中转流量驱动**：
+
+- **analytics events**：`codex_thread_initialized` / `codex_turn_event` /
+  `codex_compaction_event` → `POST {chatgpt_base}/codex/analytics-events/events`。
+  每账号一条独立队列（对齐官方 mpsc(256) + 发送前重读 auth + 非 2xx 不重试），
+  鉴权头与官方同一函数（各账号自己的 token）。字段顺序、可空字段、嵌套 metadata 按官方
+  `analytics/src/events.rs` 声明逐字段对齐；usage/工具计数/时序取自线上字节。
+- **Statsig metrics**：直接复用官方 `codex-otel`（同一 OTLP 导出器、内置 key、
+  Delta temporality、60s 周期、meter `codex`），指标集与标签顺序同官方
+  （`codex.sse_event`、`codex.turn.ttft/ttfm/e2e`、`codex.turn.tool.call`、
+  `codex.thread.started`、`codex.task.compact` 等）。
+- **turn 边界重建**：官方的 turn = 多次 sampling + 工具执行，中继按 input 尾部的
+  tool-output call_id 归并续接请求（同 turn_id、`sampling_request_count++`），
+  失败后同 input 重发识别为官方 retry（`sampling_retry_count++`）。副产品：
+  **同一 turn 的多次 sampling 现在复用同一 turn_id**（修正了此前每请求新 id 的数据面偏差）。
+- 不编造：上游不可见的值一律取官方默认配置值（`sandbox_policy="read_only"`、
+  `service_tier="default"`、`approval_policy="on-request"` 等）；确无来源的字段（如 v2
+  compaction 的 `retained_image_count`）留空而不是猜。逐字段依据与刻意偏差见
+  [docs/AUDIT.md](docs/AUDIT.md) 第四节。
+
 ## Linux 编译
 
 官方链路含 C 依赖（zstd/ring/aws-lc/openssl），需要在 Linux 机器上本地编译
@@ -210,6 +236,31 @@ reasoning/verbosity 等）。完整审计（含刻意偏差及理由）见 [docs
 - 中转共享的是 ChatGPT 订阅额度，违反 OpenAI ToS，账号有封禁风险
 - 会话粘性：同会话请求尽量落同一账号（保 prompt cache），`sticky_ttl_secs` 控制 TTL
 - 429/5xx/网络错误按账号冷却 + 指数退避换号；4xx 请求问题直接镜像给下游
+- Web search（上游提供的搜索工具）完整支持：非 lite 模型的 hosted `web_search` 工具 spec
+  原样透传（官方只在非 lite 模型上发送）；lite 模型走官方 standalone 流程——下游声明
+  `web.run` 命名空间工具（lite 序列化进 additional_tools，与官方一致）→ 模型发起调用 →
+  客户端经 `POST /alpha/search` 执行（同一账号粘性、官方 SearchClient 形状）→ 结果作为
+  function_call_output 回填。`web.run` 为上游保留工具，声明 schema 必须是空 properties
+  （或官方扩展的精确 schema），否则 400「reserved for use by this model」
+- Compact（上下文压缩）完整支持：0.153.4 官方默认 **v2**（`remote_compaction_v2` Stable
+  默认开启）——下游把 `{"type":"compaction_trigger"}` 项追加进普通 `/responses` 请求，
+  中继重建时保留该项并把 turn metadata 换成 `request_kind:"compaction"` + 下游自带的
+  CompactionTurnMetadata 块（实测端到端返回 `compaction` 输出项与逐项 usage 归因）；
+  legacy `/responses/compact` 端点也已按官方 CompactClient 形状实现（session-id+thread-id
+  双头、installation-id 头、routing hint、CompactionInput 字段序），但上游目前对该端点
+  404（官方旧式客户端同样如此），拒绝原样镜像
+- 凭证失效语义：token 刷新被上游永久拒绝（官方 `RefreshTokenError::Permanent`，如 refresh token
+  被吊销）或刷新成功仍 401 → 账号标记「凭证失效」并跳过选号（不再空转刷新），面板显示原因，
+  可一键「重新登录」（同名覆盖凭证，热重载后自动恢复）或「删除」；全部失效时业务端点返回
+  503 `accounts_invalid`。状态为进程内判定：重启后由**启动时的模型清单刷新兼任健康探针**
+  （同样走 401→刷新→重试一次），数秒内收敛到「可用」或「凭证失效」——覆盖上游在 JWT exp
+  之前服务端吊销 access token 的情形（该情形主动刷新不可见，只有实测才暴露）
 - `identity.version` 一般留空用烘焙值；如上游发布新版客户端而镜像未升级，可临时手工指定
 - 开发自检：`CCODEX_UPSTREAM_BASE_URL_OVERRIDE=http://127.0.0.1:9123` 可指向本地 mock；
-  `testdata/mock_upstream.py` + `testdata/verify_smoke.py`（HTTP）+ `testdata/verify_ws.py`（WS）是配套冒烟工具
+  `testdata/mock_upstream.py` + `testdata/verify_smoke.py`（HTTP）+ `testdata/verify_ws.py`（WS）
+  是配套冒烟工具；`testdata/verify_compact.py`（本地 mock）与 `testdata/verify_compact_live.py`
+  （服务器实跑）覆盖 compact 双路径；`testdata/verify_websearch.py` 在服务器上跑官方
+  web search 端到端三步流程（声明 web.run → /alpha/search 执行 → 回填 output）
+- 遥测自检：`python testdata/verify_telemetry_e2e.py` 一键起 mock 上游 + 假账号 + 本地中继，
+  断言 42 项（三类事件字段序与取值、turn 边界/续接/重试归并、失败映射、匿名一次性
+  thread、OTLP resource/指标集/标签）——遥测代码改动的回归哨兵

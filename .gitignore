@@ -26,3 +26,5 @@ Thumbs.db
 
 # TS 构建缓存
 *.tsbuildinfo
+tools/__pycache__/
+tools/_*.py

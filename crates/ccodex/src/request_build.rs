@@ -30,7 +30,23 @@ const THREAD_SOURCE: &str = "user";
 const SANDBOX_TAG: &str = "none";
 const SANDBOX_MODE_TAG: &str = "read-only";
 const REQUEST_KIND_TURN: &str = "turn";
+const REQUEST_KIND_COMPACTION: &str = "compaction";
 
+/// Official CompactionTurnMetadata fallback when the downstream client did not send its own
+/// (official clients always attach one to compaction requests; we copy theirs verbatim).
+/// `implementation` is "responses_compaction_v2" (trigger item over /responses) or
+/// "responses_compact" (legacy /responses/compact endpoint).
+pub(crate) fn default_compaction_metadata(implementation: &str) -> Value {
+    json!({
+        "trigger": "manual",
+        "reason": "user_requested",
+        "implementation": implementation,
+        "phase": "standalone_turn",
+        "strategy": "memento",
+    })
+}
+
+#[derive(Clone)]
 pub struct SessionCtx {
     /// Session stickiness key (api-key isolated, hashed); empty for anonymous requests.
     pub key: String,
@@ -144,7 +160,10 @@ pub fn derive_session(
         .or_else(|| header_str("conversation_id"))
         .or_else(|| header_str("thread-id"))
         .or_else(|| body_str("prompt_cache_key"))
-        .or_else(|| body_str("previous_response_id"));
+        .or_else(|| body_str("previous_response_id"))
+        // alpha/search SearchRequest: the official executor puts the conversation session
+        // id in the body's `id` field (no session headers on that endpoint).
+        .or_else(|| body_str("id"));
 
     let key_material = |seed: &str| {
         if session_isolation {
@@ -208,7 +227,9 @@ impl std::error::Error for BuildError {}
 /// Builds the upstream request from scratch per official logic. turn_id /
 /// turn_started_at_unix_ms are fixed by the caller for one upstream turn (a same-account
 /// 401 refresh retry reuses them; an account switch starts a fresh turn on a fresh
-/// session); installation_id varies per account.
+/// session); installation_id varies per account. `compaction_meta` is the downstream
+/// client's CompactionTurnMetadata block (from its x-codex-turn-metadata header), used
+/// when the input carries a compaction_trigger item (official remote compaction v2).
 pub fn build_upstream_request(
     downstream: &Value,
     session: &SessionCtx,
@@ -216,6 +237,7 @@ pub fn build_upstream_request(
     installation_id: &str,
     turn_id: &str,
     turn_started_at_unix_ms: i64,
+    compaction_meta: Option<&Value>,
 ) -> Result<BuiltRequest, BuildError> {
     let obj = downstream.as_object();
     let model = obj
@@ -305,6 +327,22 @@ pub fn build_upstream_request(
     };
 
     // ---- turn metadata (one JSON shared by body client_metadata and the x-codex-turn-metadata header) ----
+    // Official remote compaction v2 appends a {"type":"compaction_trigger"} item to a normal
+    // /responses call and labels the turn metadata request_kind=compaction (+ its
+    // CompactionTurnMetadata block, copied from the downstream header when present).
+    let is_compaction = input
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"));
+    let default_compaction;
+    let (request_kind, compaction_block) = if is_compaction {
+        default_compaction = default_compaction_metadata("responses_compaction_v2");
+        (
+            REQUEST_KIND_COMPACTION,
+            Some(compaction_meta.unwrap_or(&default_compaction)),
+        )
+    } else {
+        (REQUEST_KIND_TURN, None)
+    };
     let window_id = session.window_id();
     let turn_metadata = build_turn_metadata(
         &behavior,
@@ -313,6 +351,8 @@ pub fn build_upstream_request(
         &window_id,
         turn_id,
         turn_started_at_unix_ms,
+        request_kind,
+        compaction_block,
     );
     let turn_metadata_json =
         serde_json::to_string(&turn_metadata).expect("turn metadata serializes");
@@ -333,6 +373,14 @@ pub fn build_upstream_request(
         &mut extra_headers,
         "x-codex-turn-metadata",
         &turn_metadata_json,
+    );
+    // Official build_routing_hint_header: codex backend (ChatGPT auth) always sends
+    // model=<slug>, with ;tier=<service_tier> appended when a tier is configured
+    // (ours never is — service_tier is omitted from the body for the same reason).
+    insert_header(
+        &mut extra_headers,
+        "x-codex-routing-hint",
+        &format!("model={model}"),
     );
 
     let (final_instructions, final_input, final_tools) = if behavior.use_responses_lite {
@@ -411,17 +459,195 @@ pub fn build_upstream_request(
     })
 }
 
+/// Builds the legacy `/responses/compact` request (official CompactionInput shape) from a
+/// downstream compact call. Same rules as build_upstream_request: the body is assembled in
+/// official struct field order from semantically extracted fields only; identity fields
+/// (prompt_cache_key, installation/session ids) are rebuilt per account. Unary plain JSON
+/// (no store/stream/include/tool_choice/client_metadata — CompactionInput has none).
+///
+/// Official shape (core client.compact_conversation_history → codex-api CompactionInput):
+/// instructions/tools stay top-level even for lite models (no lite prefix-item conversion);
+/// reasoning/text resolve exactly like a normal turn; item prep strips unprefixed ids only.
+#[allow(clippy::too_many_arguments)]
+pub fn build_compact_request(
+    downstream: &Value,
+    session: &SessionCtx,
+    model_db: &ModelDb,
+    installation_id: &str,
+    turn_id: &str,
+    turn_started_at_unix_ms: i64,
+    compaction_meta: Option<&Value>,
+) -> Result<BuiltRequest, BuildError> {
+    let obj = downstream.as_object();
+    let model = obj
+        .and_then(|o| o.get("model"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or(BuildError::MissingModel)?
+        .to_string();
+    let behavior = model_db.for_model(&model);
+
+    let instructions = obj
+        .and_then(|o| o.get("instructions"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| behavior.base_instructions.clone());
+
+    let mut input = extract_input(obj)?;
+    // Official prepare_response_items_for_request for compact: unprefixed id strip only.
+    normalize_input_items(&mut input, false);
+
+    let tools = obj.and_then(|o| o.get("tools")).and_then(Value::as_array);
+    let parallel_tool_calls = obj
+        .and_then(|o| o.get("parallel_tool_calls"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    // reasoning: copy the downstream's (officially built) value, else resolve like a turn.
+    let reasoning = obj
+        .and_then(|o| o.get("reasoning"))
+        .filter(|r| r.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            let effort = resolve_reasoning_effort(&behavior.default_reasoning_level, &behavior);
+            let mut r = Map::new();
+            r.insert("effort".into(), Value::String(effort));
+            if behavior.supports_reasoning_summary_parameter
+                && behavior.default_reasoning_summary != "none"
+            {
+                r.insert(
+                    "summary".into(),
+                    Value::String(behavior.default_reasoning_summary.clone()),
+                );
+            }
+            if behavior.use_responses_lite {
+                r.insert("context".into(), json!("all_turns"));
+            }
+            Value::Object(r)
+        });
+
+    let service_tier = obj
+        .and_then(|o| o.get("service_tier"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    // text: copy downstream's, else the model-default verbosity (official compact has no
+    // output schema, so no format key is ever synthesized here).
+    let text = obj
+        .and_then(|o| o.get("text"))
+        .filter(|t| t.is_object())
+        .cloned()
+        .or_else(|| {
+            behavior
+                .support_verbosity
+                .then(|| behavior.default_verbosity.clone())
+                .flatten()
+                .map(|v| json!({ "verbosity": v }))
+        });
+
+    let access_programs = obj.and_then(|o| o.get("access_programs")).cloned();
+
+    // ---- turn metadata: request_kind=compaction + CompactionTurnMetadata block ----
+    let default_compaction = default_compaction_metadata("responses_compact");
+    let compaction_block = compaction_meta.unwrap_or(&default_compaction);
+    let window_id = session.window_id();
+    let turn_metadata = build_turn_metadata(
+        &behavior,
+        installation_id,
+        session,
+        &window_id,
+        turn_id,
+        turn_started_at_unix_ms,
+        REQUEST_KIND_COMPACTION,
+        Some(compaction_block),
+    );
+    let turn_metadata_json =
+        serde_json::to_string(&turn_metadata).expect("turn metadata serializes");
+
+    // ---- headers: the official compact_conversation_history set ----
+    let mut extra_headers = HeaderMap::new();
+    // installation id is a real HTTP header here (CompactionInput has no client_metadata).
+    insert_header(
+        &mut extra_headers,
+        "x-codex-installation-id",
+        installation_id,
+    );
+    insert_header(&mut extra_headers, "x-codex-window-id", &window_id);
+    insert_header(
+        &mut extra_headers,
+        "x-codex-turn-metadata",
+        &turn_metadata_json,
+    );
+    let routing_hint = match &service_tier {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    };
+    insert_header(&mut extra_headers, "x-codex-routing-hint", &routing_hint);
+    if behavior.use_responses_lite {
+        insert_header(
+            &mut extra_headers,
+            "x-openai-internal-codex-responses-lite",
+            "true",
+        );
+    }
+    // beta-features / turn-state / attestation: absent under default config (turn-state is
+    // stripped by relay policy, same as /responses).
+
+    // ---- Assemble in official CompactionInput struct order ----
+    let mut body = Map::new();
+    body.insert("model".into(), Value::String(model));
+    body.insert("input".into(), Value::Array(input));
+    if !instructions.is_empty() {
+        body.insert("instructions".into(), Value::String(instructions));
+    }
+    if let Some(tools) = tools {
+        body.insert("tools".into(), Value::Array(tools.clone()));
+    }
+    body.insert(
+        "parallel_tool_calls".into(),
+        Value::Bool(parallel_tool_calls),
+    );
+    body.insert("reasoning".into(), reasoning);
+    if let Some(tier) = &service_tier {
+        body.insert("service_tier".into(), Value::String(tier.clone()));
+    }
+    body.insert(
+        "prompt_cache_key".into(),
+        Value::String(session.session_id.to_string()),
+    );
+    if let Some(text) = text {
+        body.insert("text".into(), text);
+    }
+    if let Some(ap) = access_programs {
+        body.insert("access_programs".into(), ap);
+    }
+
+    Ok(BuiltRequest {
+        body: Value::Object(body),
+        extra_headers,
+    })
+}
+
 /// Official CodexTurnMetadataPayload field order (default first-turn shape with
-/// request_kind=turn).
-fn build_turn_metadata(
+/// request_kind=turn). Also used by the alpha/search forwarder (official SearchClient
+/// sends the same metadata shape as the originating turn). Compaction requests
+/// (v2 trigger item over /responses, or legacy /responses/compact) carry
+/// request_kind=compaction plus the CompactionTurnMetadata block, appended last per
+/// the official payload struct order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_turn_metadata(
     behavior: &ModelBehavior,
     installation_id: &str,
     session: &SessionCtx,
     window_id: &str,
     turn_id: &str,
     turn_started_at_unix_ms: i64,
+    request_kind: &str,
+    compaction: Option<&Value>,
 ) -> Value {
-    json!({
+    let mut meta = json!({
         "installation_id": installation_id,
         "session_id": session.session_id.to_string(),
         "thread_id": session.thread_id.to_string(),
@@ -429,7 +655,7 @@ fn build_turn_metadata(
         "turn_id": turn_id,
         "window_id": window_id,
         "window_number": 0,
-        "request_kind": REQUEST_KIND_TURN,
+        "request_kind": request_kind,
         "thread_source": THREAD_SOURCE,
         "sandbox": SANDBOX_TAG,
         "sandbox_mode": SANDBOX_MODE_TAG,
@@ -437,7 +663,11 @@ fn build_turn_metadata(
         "node_repl_auto_review_required": behavior.node_repl_auto_review_required,
         "node_repl_disabled": behavior.node_repl_disabled,
         "turn_started_at_unix_ms": turn_started_at_unix_ms,
-    })
+    });
+    if let Some(compaction) = compaction {
+        meta["compaction"] = compaction.clone();
+    }
+    meta
 }
 
 /// Downstream input accepts an array (standard) or a string (Responses API shorthand,
@@ -498,7 +728,7 @@ fn is_prefixed_id(id: &str) -> bool {
 /// Official ModelInfo::resolve_reasoning_effort:
 /// ultra → multi_agent_reasoning_effort (if supported) → max → last non-ultra → medium;
 /// persistent → "disabled"; anything else passes through.
-fn resolve_reasoning_effort(effort: &str, behavior: &ModelBehavior) -> String {
+pub(crate) fn resolve_reasoning_effort(effort: &str, behavior: &ModelBehavior) -> String {
     match effort {
         "ultra" => {
             if let Some(ma) = &behavior.multi_agent_reasoning_effort
@@ -667,6 +897,7 @@ mod tests {
             "11111111-1111-4111-8111-111111111111",
             "0192f8c0-0000-7000-8000-000000000000",
             1_700_000_000_123,
+            None,
         )
         .unwrap();
         let body = &built.body;
@@ -795,7 +1026,7 @@ mod tests {
             "tools": [{"type":"function","name":"shell","parameters":{"type":"object"}}],
         });
         let built =
-            build_upstream_request(&downstream, &session(), &db, "inst", "turn", 1).unwrap();
+            build_upstream_request(&downstream, &session(), &db, "inst", "turn", 1, None).unwrap();
         let body = &built.body;
         assert_eq!(
             body_keys(body),
@@ -839,7 +1070,7 @@ mod tests {
     fn summary_default_from_model() {
         let db = test_db();
         let downstream = json!({"model":"gpt-5.2","input":[]});
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1).unwrap();
+        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         assert_eq!(
             built.body["reasoning"],
             json!({"effort":"medium","summary":"auto"})
@@ -857,7 +1088,7 @@ mod tests {
             "reasoning": {"effort":"ultra","summary":"detailed"},
             "text": {"verbosity":"high","format":{"type":"json_schema","schema":{"type":"object"},"strict":false}},
         });
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1).unwrap();
+        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         // gpt-5.5 has no max/ultra → resolves to the last supported non-ultra = xhigh.
         assert_eq!(
             built.body["reasoning"],
@@ -887,7 +1118,7 @@ mod tests {
                 ]},
             ],
         });
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1).unwrap();
+        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         let input = built.body["input"].as_array().unwrap();
         let user_msg = &input[2];
         assert!(
@@ -910,7 +1141,7 @@ mod tests {
     fn missing_model_rejected() {
         let db = test_db();
         let err =
-            build_upstream_request(&json!({"input":[]}), &session(), &db, "i", "t", 1).unwrap_err();
+            build_upstream_request(&json!({"input":[]}), &session(), &db, "i", "t", 1, None).unwrap_err();
         assert!(matches!(err, BuildError::MissingModel));
     }
 

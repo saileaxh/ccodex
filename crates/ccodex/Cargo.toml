@@ -14,6 +14,7 @@ codex-login = { path = "../../vendor/codex/codex-rs/login" }
 codex-model-provider = { path = "../../vendor/codex/codex-rs/model-provider" }
 codex-model-provider-info = { path = "../../vendor/codex/codex-rs/model-provider-info" }
 codex-http-client = { path = "../../vendor/codex/codex-rs/http-client" }
+codex-otel = { path = "../../vendor/codex/codex-rs/otel" }
 
 anyhow = "1"
 async-stream = "0.3"
@@ -22,6 +23,7 @@ bytes = "1"
 clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 http = "1.3"
+os_info = "3.12.0"
 # The socks feature flows through feature unification into the official reqwest client,
 # enabling socks5/socks5h proxies (incl. credentials embedded in the URL), so env proxies
 # like ALL_PROXY=socks5://user:pass@... work.

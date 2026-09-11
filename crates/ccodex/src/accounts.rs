@@ -13,6 +13,28 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+/// Credential health verdict learned from upstream traffic. In-memory only: a restart
+/// re-probes once (one request → refresh → classify), which self-heals if auth.json was
+/// fixed on disk and re-marks a still-dead credential.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AuthStatus {
+    /// No traffic verdict yet this process.
+    Unknown,
+    /// Last upstream contact authenticated fine.
+    Ok,
+    /// Upstream says the credentials are dead (official RefreshTokenError::Permanent, or a
+    /// successful refresh still yielding 401). Skipped in selection until a re-login
+    /// rebuilds the account (pool reload creates fresh Account objects).
+    Invalid { reason: String, since_unix: u64 },
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 pub struct Account {
     pub name: String,
     pub auth_manager: Arc<AuthManager>,
@@ -35,10 +57,16 @@ pub struct Account {
     /// Per-account official HTTP client: one process = one account = one client upstream,
     /// so each account gets its own connection pool and Cloudflare cookie jar and no two
     /// account ids ever share a TLS/H2 connection. Built with the account's proxy binding
-    /// injected into the env vars reqwest reads (see proxies::build_official_client).
+    /// injected into the env vars reqwest reads (see proxies::with_binding).
     pub transport: ReqwestTransport,
+    /// Per-account official Statsig metrics client (exporter + periodic reader), built in
+    /// the same binding swap as `transport` so its OTLP exports leave through the account's
+    /// own proxy — the same exit IP as this account's conversation traffic.
+    pub metrics: std::sync::Arc<codex_otel::MetricsClient>,
     cooldown_until_ms: AtomicU64,
     consecutive_failures: AtomicU64,
+    /// Latest credential health verdict (see AuthStatus).
+    auth_status: RwLock<AuthStatus>,
     /// Latest upstream quota snapshot (official rate_limits parse result, as JSON) for the admin UI.
     last_quotas: RwLock<Option<serde_json::Value>>,
 }
@@ -70,13 +98,38 @@ fn now_millis() -> u64 {
 }
 
 impl Account {
+    /// Selectable for upstream traffic: not cooling down and credentials not known-dead.
     pub fn available(&self) -> bool {
-        now_millis() >= self.cooldown_until_ms.load(Ordering::Relaxed)
+        now_millis() >= self.cooldown_until_ms.load(Ordering::Relaxed) && !self.auth_invalid()
     }
 
     pub fn cooldown_remaining(&self) -> Duration {
         let until = self.cooldown_until_ms.load(Ordering::Relaxed);
         Duration::from_millis(until.saturating_sub(now_millis()))
+    }
+
+    pub fn auth_status(&self) -> AuthStatus {
+        self.auth_status.read().unwrap().clone()
+    }
+
+    pub fn auth_invalid(&self) -> bool {
+        matches!(
+            &*self.auth_status.read().unwrap(),
+            AuthStatus::Invalid { .. }
+        )
+    }
+
+    pub fn mark_auth_ok(&self) {
+        *self.auth_status.write().unwrap() = AuthStatus::Ok;
+    }
+
+    pub fn mark_auth_invalid(&self, reason: impl Into<String>) {
+        let reason = reason.into();
+        tracing::warn!(account = %self.name, reason = %reason, "account credentials invalid, skipping until re-login");
+        *self.auth_status.write().unwrap() = AuthStatus::Invalid {
+            reason,
+            since_unix: now_unix(),
+        };
     }
 
     pub fn cool_down(&self, dur: Duration) {
@@ -237,25 +290,27 @@ impl Pool {
                     Arc::clone(&manager),
                     &auth,
                 );
-                let (proxy_label, transport) = match proxies.binding(&name) {
-                    crate::proxies::Binding::Default => (
-                        None,
+                let binding = proxies.binding(&name);
+                let proxy_label = match &binding {
+                    crate::proxies::Binding::Default => None,
+                    crate::proxies::Binding::Direct => {
+                        Some(crate::proxies::DIRECT.to_string())
+                    }
+                    crate::proxies::Binding::Proxy { name, .. } => Some(name.clone()),
+                };
+                // Data plane and telemetry are built in one env swap: the account's metrics
+                // exporter must egress through the account's own proxy, i.e. the same exit
+                // IP as its conversation traffic (official: one process, one account, one
+                // proxy for both channels).
+                let (transport, metrics) = crate::proxies::with_binding(&binding, || {
+                    (
                         ReqwestTransport::from_http_client(
                             codex_login::default_client::create_client(),
                         ),
-                    ),
-                    crate::proxies::Binding::Direct => (
-                        Some(crate::proxies::DIRECT.to_string()),
-                        crate::proxies::build_official_client(None).await,
-                    ),
-                    crate::proxies::Binding::Proxy {
-                        name: proxy_name,
-                        url,
-                    } => (
-                        Some(proxy_name),
-                        crate::proxies::build_official_client(Some(&url)).await,
-                    ),
-                };
+                        crate::metrics::build_account_client(),
+                    )
+                })
+                .await;
                 tracing::info!(account = %name, account_id = ?account_id, email = ?account_email, plan = ?plan, proxy = ?proxy_label, "loaded account");
                 accounts.push(Arc::new(Account {
                     name,
@@ -268,8 +323,10 @@ impl Pool {
                     installation_id,
                     proxy: proxy_label,
                     transport,
+                    metrics,
                     cooldown_until_ms: AtomicU64::new(0),
                     consecutive_failures: AtomicU64::new(0),
+                    auth_status: RwLock::new(AuthStatus::Unknown),
                     last_quotas: RwLock::new(None),
                 }));
             }

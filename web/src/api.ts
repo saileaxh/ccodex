@@ -68,12 +68,19 @@ export interface PeriodUsage {
   totals: UsageTotals;
 }
 
+export interface AccountAuthStatus {
+  state: "unknown" | "ok" | "invalid";
+  reason?: string | null;
+  since_unix?: number | null;
+}
+
 export interface AccountInfo {
   name: string;
   account_id: string | null;
   email: string | null;
   plan: string | null;
   available: boolean;
+  auth_status: AccountAuthStatus | null;
   cooldown_remaining_secs: number;
   quotas: QuotaInfo[] | null;
   proxy: string | null;
@@ -171,6 +178,11 @@ export const api = {
     "/admin/api/accounts/reload",
     { method: "POST" }
   ),
+  removeAccount: (name: string) =>
+    request<{ ok: boolean; accounts?: number; error?: string }>(
+      `/admin/api/accounts/${encodeURIComponent(name)}`,
+      { method: "DELETE" }
+    ),
   startDeviceLogin: (name: string) =>
     request<DeviceLoginStart>("/admin/api/accounts/device-login", {
       method: "POST",
