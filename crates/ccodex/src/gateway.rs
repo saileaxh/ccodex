@@ -274,6 +274,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/health", get(handle_health))
         .merge(crate::admin::router(Arc::clone(&state)))
         .fallback(crate::web::static_handler)
+        // Responses 中转负载远大于 axum 默认 2MB：官方客户端发来的完整会话上下文轻松
+        // 超过该值，否则会被 "Failed to buffer the request body: length limit exceeded" 413
+        // 拒掉。关闭默认上限；真正的尺寸边界由上游与 nginx 决定。
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(state)
 }
 

@@ -141,7 +141,15 @@ fn main() -> anyhow::Result<()> {
 /// Outbound proxy: written into the env vars reqwest's system-proxy logic reads (same
 /// proxy path as the official client). Existing env vars win.
 fn apply_proxy_env(proxy: &str) {
-    for var in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+    // 与 proxies::PROXY_VARS 同步：http:// 目标（e2e 的本地 mock）只查 HTTP_PROXY。
+    for var in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
         if std::env::var(var).is_err() {
             // SAFETY: called in the single-threaded phase before the runtime starts.
             unsafe { std::env::set_var(var, proxy) };

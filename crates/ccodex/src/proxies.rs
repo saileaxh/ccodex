@@ -287,7 +287,18 @@ async fn check_proxy_inner(url: Option<&str>) -> Result<String, String> {
 /// because the quota fetch must hold it across .await (the official route-aware pool builds
 /// its reqwest client lazily at request time, reading the ambient proxy env then).
 static PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-const PROXY_VARS: [&str; 4] = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+// 必须同时写 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY：reqwest/hyper-util 的 intercept 对
+// http:// 目标只查 HTTP_PROXY/http_proxy（ALL_PROXY 只在没有按协议命中时兜底，且部分
+// 版本不用于 http 目标）。e2e 的本地 mock 是 http://，漏掉 HTTP_PROXY 会让"绑定代理"
+// 在该场景下静默失效。生产目标是 https://，但仍一并写齐以免场景差异。
+const PROXY_VARS: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
 
 /// How to set the proxy env vars for one swap section.
 pub enum ProxyEnv {
@@ -372,6 +383,19 @@ pub fn env_mode(binding: &Binding) -> ProxyEnv {
 /// than the conversation it belongs to.
 pub async fn with_binding<T>(binding: &Binding, build: impl FnOnce() -> T) -> T {
     let _guard = ProxyEnvGuard::acquire(env_mode(binding)).await;
+    #[cfg(debug_assertions)]
+    if let Binding::Proxy { url, .. } = binding {
+        tracing::debug!(
+            proxy = %url,
+            http_proxy = ?std::env::var("http_proxy"),
+            HTTP_PROXY = ?std::env::var("HTTP_PROXY"),
+            https_proxy = ?std::env::var("https_proxy"),
+            HTTPS_PROXY = ?std::env::var("HTTPS_PROXY"),
+            all_proxy = ?std::env::var("all_proxy"),
+            ALL_PROXY = ?std::env::var("ALL_PROXY"),
+            "with_binding env after swap"
+        );
+    }
     build()
 }
 
