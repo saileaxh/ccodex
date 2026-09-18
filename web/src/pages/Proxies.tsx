@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api, type ProxiesResponse, type ProxyCheck } from "@/api";
+import { toast } from "@/components/ui/toast";
 
 function formatCheck(check: ProxyCheck | null): { text: string; ok: boolean | null } {
   if (!check) return { text: "未检测", ok: null };
@@ -17,7 +18,6 @@ function formatCheck(check: ProxyCheck | null): { text: string; ok: boolean | nu
 export default function ProxiesPage() {
   const [data, setData] = useState<ProxiesResponse | null>(null);
   const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [adding, setAdding] = useState(false);
@@ -36,48 +36,46 @@ export default function ProxiesPage() {
   const add = async (e: React.FormEvent) => {
     e.preventDefault();
     setAdding(true);
-    setNotice("");
     try {
       const r = await api.addProxy(name.trim(), url.trim());
       if (!r.ok) {
-        setNotice(r.error ?? "添加失败");
+        toast.error(r.error ?? "添加失败");
         return;
       }
       setName("");
       setUrl("");
-      setNotice("已添加");
+      toast.success("已添加");
       await load();
     } catch (err) {
-      setNotice(String(err));
+      toast.error(String(err));
     } finally {
       setAdding(false);
     }
   };
 
   const remove = async (proxyName: string) => {
-    setNotice("");
     try {
       const r = await api.deleteProxy(proxyName);
-      setNotice(r.ok ? `已删除 ${proxyName}（绑定账号回落到默认出口）` : (r.error ?? "删除失败"));
+      if (r.ok) toast.success(`已删除 ${proxyName}（绑定账号回落到默认出口）`);
+      else toast.error(r.error ?? "删除失败");
       await load();
     } catch (err) {
-      setNotice(String(err));
+      toast.error(String(err));
     }
   };
 
   const test = async (proxyName: string | null, tag: string) => {
     setTesting(tag);
-    setNotice("");
     try {
       const r = await api.testProxy(proxyName);
       if (r.ok) {
-        setNotice(`${tag} 出口: ${r.ip} (${r.latency_ms}ms)`);
+        toast.success(`${tag} 出口: ${r.ip} (${r.latency_ms}ms)`);
       } else {
-        setNotice(`${tag} 检测失败: ${r.error ?? "未知错误"}`);
+        toast.error(`${tag} 检测失败: ${r.error ?? "未知错误"}`);
       }
       await load();
     } catch (err) {
-      setNotice(String(err));
+      toast.error(String(err));
     } finally {
       setTesting(null);
     }
@@ -96,7 +94,6 @@ export default function ProxiesPage() {
   return (
     <div className="space-y-6">
       <h1 className="text-2xl font-semibold tracking-tight">代理池</h1>
-      {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       <Card>

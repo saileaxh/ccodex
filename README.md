@@ -124,7 +124,41 @@ env_key = "OPENAI_API_KEY"   # 值填面板「密钥」页生成的 sk- 访问�
 > 两域互不通用。用量与成本按密钥指纹/账号归因，持久化在 usage.json（0600）；
 > 成本 = 官方 API 定价换算的等效花费（订阅账号实际不按 token 计费）。
 
+## 用量与成本
+
+账号的周期统计只包含经过本机网关且上游返回 usage 的请求，按上游主配额窗口归集。
+重置时间的小幅抖动不会清零；界面同时展示请求数、输入、缓存命中和输出。
+缓存命中是输入 Tokens 的子集，不重复计数；等效成本按模型的参考 API 单价估算，
+不是订阅账号的实际扣费。旧版本因周期重置时间抖动丢失的周期明细无法完整恢复，
+累计统计保留，下一个周期正常重新归集。
+
 ## 代理
+
+### 内置 Shadowsocks
+
+`upstream_proxy` 可直接填写 `ss://` 节点链接。ccodex 在同一进程内完成 Shadowsocks
+加密转发，无需安装或运行 sing-box，也不修改系统路由或其他进程的代理设置。
+支持 AEAD 和 AEAD-2022，包括 `2022-blake3-aes-128-gcm`。协议实现使用
+[shadowsocks-rust](https://github.com/shadowsocks/shadowsocks-rust) 的核心库。
+
+```toml
+upstream_proxy = "ss://2022-blake3-aes-128-gcm:BASE64_KEY_URL_ENCODED@proxy.example.com:8388"
+```
+
+将示例替换为节点提供的真实链接；明文格式中密钥的 `+`、`/`、`=` 等字符需要 URL 编码，
+也可使用 SIP002 Base64 用户信息格式。2022 AES-128 密钥必须是 16 字节随机密钥的
+Base64 编码，AES-256 则为 32 字节。配置文件包含节点密钥，应限制为服务用户可读。
+
+内置转发器使用仅监听回环地址的随机端口及每次启动生成的随机认证，目标域名交由节点解析。
+HTTP、HTTPS、SSE、WebSocket 和默认出口的 OAuth/凭证刷新均使用此隧道；不支持 UDP
+或 SIP003 外部插件。隧道随应用退出而关闭，连接失败不会回落直连。
+使用 `ss://` 时会覆盖当前进程继承的 HTTP/HTTPS/ALL_PROXY，使配置的节点生效；
+`NO_PROXY` 仍按客户端规则生效，请勿将需要代理的上游域名加入其中。
+
+此设置用于配置文件中的默认出口；管理面板命名代理池仍接受 HTTP/SOCKS 地址，
+显式绑定的代理及 `direct` 继续覆盖默认出口。修改默认节点后重启 ccodex。
+
+### HTTP / SOCKS 代理
 
 `upstream_proxy` 支持 `http://` / `https://` / `socks5://` / `socks5h://`，可内嵌认证
 （如 `socks5h://user:pass@127.0.0.1:1080`）。实现路径与官方客户端一致：配置写入

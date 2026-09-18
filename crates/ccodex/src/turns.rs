@@ -103,7 +103,11 @@ pub fn failure_from_http_reject(status: u16, body: &[u8]) -> TurnFailure {
         .and_then(|c| c.as_str())
         .map(str::to_string);
 
-    if status == 503 && matches!(error_code.as_deref(), Some("server_is_overloaded" | "slow_down"))
+    if status == 503
+        && matches!(
+            error_code.as_deref(),
+            Some("server_is_overloaded" | "slow_down")
+        )
     {
         return TurnFailure {
             kind: "server_overloaded",
@@ -571,9 +575,9 @@ pub fn has_compaction_trigger(body: &Value) -> bool {
     body.get("input")
         .and_then(Value::as_array)
         .is_some_and(|items| {
-            items.iter().any(|item| {
-                item.get("type").and_then(Value::as_str) == Some("compaction_trigger")
-            })
+            items
+                .iter()
+                .any(|item| item.get("type").and_then(Value::as_str) == Some("compaction_trigger"))
         })
 }
 
@@ -586,17 +590,15 @@ fn count_turn_input_images(body: &Value) -> usize {
     let mut count = 0;
     for item in items.iter().rev() {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
-        let is_user_message = item_type == "message"
-            && item.get("role").and_then(Value::as_str) == Some("user");
+        let is_user_message =
+            item_type == "message" && item.get("role").and_then(Value::as_str) == Some("user");
         if !is_user_message {
             break;
         }
         if let Some(parts) = item.get("content").and_then(Value::as_array) {
             count += parts
                 .iter()
-                .filter(|p| {
-                    p.get("type").and_then(Value::as_str) == Some("input_image")
-                })
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("input_image"))
                 .count();
         }
     }
@@ -742,9 +744,7 @@ impl TurnTracker {
         if let Some(open) = session.open.take() {
             let mut open = open;
             match open.outcome {
-                Outcome::Failed | Outcome::InFlight
-                    if fingerprint == open.input_fingerprint =>
-                {
+                Outcome::Failed | Outcome::InFlight if fingerprint == open.input_fingerprint => {
                     // Same input again after a failed/unfinished sampling: official
                     // retry within the same turn.
                     open.retry_count += 1;
@@ -788,7 +788,7 @@ impl TurnTracker {
                 _ => {
                     // Displaced: the open turn never reached a final answer.
                     let final_kind = DisplacedFinal::from_open_turn(&open);
-                    emissions.push(self.finalize_turn(session, open, final_kind));
+                    emissions.push(self.finalize_turn(open, final_kind));
                 }
             }
         }
@@ -811,6 +811,7 @@ impl TurnTracker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_new_turn(
         &self,
         session: &mut TurnSession,
@@ -964,11 +965,9 @@ impl TurnTracker {
         let now = Instant::now();
         let stream_end = tap.last_chunk_at.unwrap_or(now);
         if let Some(start) = open.current_sampling_start.take() {
-            open.sampling_ms = open.sampling_ms.saturating_add(
-                stream_end
-                    .saturating_duration_since(start)
-                    .as_millis() as u64,
-            );
+            open.sampling_ms = open
+                .sampling_ms
+                .saturating_add(stream_end.saturating_duration_since(start).as_millis() as u64);
         }
         if let Some(usage) = tap.usage.as_ref() {
             let parsed = TokenAccum::from_wire(usage);
@@ -976,17 +975,16 @@ impl TurnTracker {
             open.usage.add_assign(&parsed);
             open.saw_any_usage = true;
         }
-        let mut declared = std::mem::take(&mut open.declared_tools);
-        for (call_id, name, item_type) in &tap.tool_calls {
-            let _ = call_id;
+        let declared = std::mem::take(&mut open.declared_tools);
+        for (_, name, item_type) in &tap.tool_calls {
             open.counts.record(item_type, name, &declared);
         }
-        declared.clear();
-        open.declared_tools = declared;
         open.pending_calls = tap
             .tool_calls
             .iter()
-            .filter(|(_, _, item_type)| item_type != "web_search_call" && item_type != "image_generation_call")
+            .filter(|(_, _, item_type)| {
+                item_type != "web_search_call" && item_type != "image_generation_call"
+            })
             .map(|(call_id, _, _)| call_id.clone())
             .filter(|call_id| !call_id.is_empty())
             .collect();
@@ -1002,7 +1000,7 @@ impl TurnTracker {
 
         if tap.completed && open.pending_calls.is_empty() {
             // Final answer: the turn is complete.
-            emissions.push(self.finalize_turn(session, open, DisplacedFinal::completed()));
+            emissions.push(self.finalize_turn(open, DisplacedFinal::Completed));
         } else if tap.completed {
             open.outcome = Outcome::PendingCalls;
             session.open = Some(open);
@@ -1060,6 +1058,7 @@ impl TurnTracker {
     /// codex_compaction_event with official v2/legacy field semantics. A compaction
     /// running INSIDE an open turn (phase pre_turn/mid_turn) books its duration into
     /// that turn's compaction_ms (official TurnProfile compaction bucket).
+    #[allow(clippy::too_many_arguments)]
     pub fn note_compaction_end(
         &self,
         attempt_session: &SessionCtx,
@@ -1165,13 +1164,8 @@ impl TurnTracker {
         }))]
     }
 
-    /// Build the turn event for a finished turn and remove it from the session.
-    fn finalize_turn(
-        &self,
-        session: &mut TurnSession,
-        turn: Box<OpenTurn>,
-        final_kind: DisplacedFinal,
-    ) -> Emission {
+    /// Build the turn event for a finished turn.
+    fn finalize_turn(&self, turn: Box<OpenTurn>, final_kind: DisplacedFinal) -> Emission {
         let (status, failure, completed_at, duration_ms) = match final_kind {
             DisplacedFinal::Completed => (
                 "completed",
@@ -1183,13 +1177,17 @@ impl TurnTracker {
                 "interrupted",
                 None,
                 turn.last_activity_unix,
-                turn.last_activity.saturating_duration_since(turn.started).as_millis() as u64,
+                turn.last_activity
+                    .saturating_duration_since(turn.started)
+                    .as_millis() as u64,
             ),
             DisplacedFinal::Failed => (
                 "failed",
                 turn.failure.clone(),
                 turn.last_activity_unix,
-                turn.last_activity.saturating_duration_since(turn.started).as_millis() as u64,
+                turn.last_activity
+                    .saturating_duration_since(turn.started)
+                    .as_millis() as u64,
             ),
         };
         let (kind, http_status, info) = match &failure {
@@ -1197,72 +1195,71 @@ impl TurnTracker {
             None => (None, None, None),
         };
         let usage = turn.saw_any_usage.then_some(turn.usage);
-        let _ = session;
         Emission::Turn(Box::new(TurnEmission {
             ttft_ms: turn.ttft_ms,
             ttfm_ms: turn.ttfm_ms,
             params: CodexTurnEventParams {
-            thread_id: turn.thread_id.clone(),
-            session_id: turn.session_id.clone(),
-            turn_id: turn.turn_id.clone(),
-            root_turn_id: None,
-            turn_trigger: None,
-            codex_turn_source: None,
-            submission_type: None,
-            app_server_client: self.env.app_client.clone(),
-            runtime: self.env.runtime.clone(),
-            ephemeral: false,
-            thread_source: Some("user"),
-            initialization_mode: "new",
-            subagent_source: None,
-            parent_thread_id: None,
-            model: Some(turn.model.clone()),
-            model_provider: "openai".to_string(),
-            sandbox_policy: Some("read_only"),
-            reasoning_effort: turn.reasoning_effort.clone(),
-            reasoning_summary: turn.reasoning_summary.clone(),
-            service_tier: "default".to_string(),
-            approval_policy: "on-request".to_string(),
-            approvals_reviewer: "user".to_string(),
-            guardian_v2_enabled: false,
-            sandbox_network_access: false,
-            collaboration_mode: Some("default"),
-            personality: None,
-            workspace_kind: None,
-            num_input_images: turn.num_input_images,
-            image_preparations: Vec::new(),
-            is_first_turn: turn.is_first_turn,
-            status: Some(status),
-            explicit_client_interrupt_requested_at_ms: None,
-            turn_error: info,
-            codex_error_kind: kind,
-            codex_error_http_status_code: http_status,
-            steer_count: Some(0),
-            total_tool_call_count: Some(turn.counts.total),
-            shell_command_count: Some(turn.counts.shell_command),
-            file_change_count: Some(turn.counts.file_change),
-            mcp_tool_call_count: Some(turn.counts.mcp_tool_call),
-            dynamic_tool_call_count: Some(turn.counts.dynamic_tool_call),
-            subagent_tool_call_count: Some(turn.counts.subagent_tool_call),
-            web_search_count: Some(turn.counts.web_search),
-            image_generation_count: Some(turn.counts.image_generation),
-            input_tokens: usage.map(|u| u.input_tokens),
-            cached_input_tokens: usage.map(|u| u.cached_input_tokens),
-            cache_write_input_tokens: usage.map(|u| u.cache_write_input_tokens),
-            output_tokens: usage.map(|u| u.output_tokens),
-            reasoning_output_tokens: usage.map(|u| u.reasoning_output_tokens),
-            total_tokens: usage.map(|u| u.total_tokens),
-            before_first_sampling_ms: turn.before_first_sampling_ms,
-            sampling_ms: turn.sampling_ms,
-            compaction_ms: turn.compaction_ms,
-            between_sampling_overhead_ms: 0,
-            tool_blocking_ms: turn.tool_blocking_ms,
-            after_last_sampling_ms: 0,
-            sampling_request_count: turn.sampling_count,
-            sampling_retry_count: turn.retry_count,
-            duration_ms: Some(duration_ms),
-            started_at: Some(turn.started_at_unix),
-            completed_at: Some(completed_at),
+                thread_id: turn.thread_id.clone(),
+                session_id: turn.session_id.clone(),
+                turn_id: turn.turn_id.clone(),
+                root_turn_id: None,
+                turn_trigger: None,
+                codex_turn_source: None,
+                submission_type: None,
+                app_server_client: self.env.app_client.clone(),
+                runtime: self.env.runtime.clone(),
+                ephemeral: false,
+                thread_source: Some("user"),
+                initialization_mode: "new",
+                subagent_source: None,
+                parent_thread_id: None,
+                model: Some(turn.model.clone()),
+                model_provider: "openai".to_string(),
+                sandbox_policy: Some("read_only"),
+                reasoning_effort: turn.reasoning_effort.clone(),
+                reasoning_summary: turn.reasoning_summary.clone(),
+                service_tier: "default".to_string(),
+                approval_policy: "on-request".to_string(),
+                approvals_reviewer: "user".to_string(),
+                guardian_v2_enabled: false,
+                sandbox_network_access: false,
+                collaboration_mode: Some("default"),
+                personality: None,
+                workspace_kind: None,
+                num_input_images: turn.num_input_images,
+                image_preparations: Vec::new(),
+                is_first_turn: turn.is_first_turn,
+                status: Some(status),
+                explicit_client_interrupt_requested_at_ms: None,
+                turn_error: info,
+                codex_error_kind: kind,
+                codex_error_http_status_code: http_status,
+                steer_count: Some(0),
+                total_tool_call_count: Some(turn.counts.total),
+                shell_command_count: Some(turn.counts.shell_command),
+                file_change_count: Some(turn.counts.file_change),
+                mcp_tool_call_count: Some(turn.counts.mcp_tool_call),
+                dynamic_tool_call_count: Some(turn.counts.dynamic_tool_call),
+                subagent_tool_call_count: Some(turn.counts.subagent_tool_call),
+                web_search_count: Some(turn.counts.web_search),
+                image_generation_count: Some(turn.counts.image_generation),
+                input_tokens: usage.map(|u| u.input_tokens),
+                cached_input_tokens: usage.map(|u| u.cached_input_tokens),
+                cache_write_input_tokens: usage.map(|u| u.cache_write_input_tokens),
+                output_tokens: usage.map(|u| u.output_tokens),
+                reasoning_output_tokens: usage.map(|u| u.reasoning_output_tokens),
+                total_tokens: usage.map(|u| u.total_tokens),
+                before_first_sampling_ms: turn.before_first_sampling_ms,
+                sampling_ms: turn.sampling_ms,
+                compaction_ms: turn.compaction_ms,
+                between_sampling_overhead_ms: 0,
+                tool_blocking_ms: turn.tool_blocking_ms,
+                after_last_sampling_ms: 0,
+                sampling_request_count: turn.sampling_count,
+                sampling_retry_count: turn.retry_count,
+                duration_ms: Some(duration_ms),
+                started_at: Some(turn.started_at_unix),
+                completed_at: Some(completed_at),
             },
         }))
     }
@@ -1284,7 +1281,7 @@ impl TurnTracker {
             return None;
         }
         let open = session.open.take()?;
-        Some(self.finalize_turn(session, open, DisplacedFinal::Failed))
+        Some(self.finalize_turn(open, DisplacedFinal::Failed))
     }
 
     /// Periodic maintenance: finalize grace-expired failures, drop turns idle past the
@@ -1322,12 +1319,6 @@ enum DisplacedFinal {
     #[default]
     Interrupted,
     Failed,
-}
-
-impl DisplacedFinal {
-    fn completed() -> Self {
-        Self::Completed
-    }
 }
 
 impl DisplacedFinal {

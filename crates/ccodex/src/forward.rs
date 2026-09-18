@@ -40,7 +40,10 @@ pub enum AttemptTelem {
     /// A regular /responses sampling of a tracked turn. `session_key` is the tracker
     /// key for this attempt: the downstream-derived key, or a per-request key the
     /// tracker minted for a keyless request.
-    Turn { turn_id: String, session_key: String },
+    Turn {
+        turn_id: String,
+        session_key: String,
+    },
     /// A compaction request (v2 trigger over /responses or legacy /responses/compact).
     Compaction(CompactionStart),
 }
@@ -217,10 +220,7 @@ async fn try_once(
             let status = resp.status;
             let headers = resp.headers.clone();
             let body = collect_body(resp.bytes).await;
-            (
-                Attempt::HttpReject(status, headers, body),
-                Some(telem),
-            )
+            (Attempt::HttpReject(status, headers, body), Some(telem))
         }
         // The official stream() maps every non-2xx to TransportError::Http carrying
         // status/headers/body — recover it as a real upstream rejection so 401/429/4xx
@@ -273,7 +273,10 @@ async fn drive_attempts<F, G>(
     on_failure: G,
 ) -> Result<Attempt, RelayError>
 where
-    F: Fn(&Account, &SessionCtx) -> Result<(serde_json::Value, HeaderMap, AttemptTelem), RelayError>,
+    F: Fn(
+        &Account,
+        &SessionCtx,
+    ) -> Result<(serde_json::Value, HeaderMap, AttemptTelem), RelayError>,
     G: Fn(&Account, &SessionCtx, &AttemptTelem, TurnFailure),
 {
     let candidates = pool.ordered_candidates(&session.key);
@@ -383,9 +386,8 @@ where
             }
             Attempt::HttpReject(status, headers, body_bytes) => {
                 if let Some(telem) = telem.as_ref() {
-                    let failure = failure_override.unwrap_or_else(|| {
-                        failure_from_http_reject(status.as_u16(), &body_bytes)
-                    });
+                    let failure = failure_override
+                        .unwrap_or_else(|| failure_from_http_reject(status.as_u16(), &body_bytes));
                     on_failure(account, &attempt_session, telem, failure);
                 }
                 match status.as_u16() {
@@ -399,7 +401,7 @@ where
                                 "token 刷新成功但上游仍返回 401，凭证已失效".to_string(),
                             );
                         } else {
-                            tracing::warn!(account = %account.name, "still 401 after refresh, cooling down 5m");
+                            tracing::warn!(account = %account.name, "401 and token refresh failed (transient), cooling down 5m");
                         }
                         account.cool_down(Duration::from_secs(300));
                         last_reject = Some((status, headers, body_bytes));
@@ -472,22 +474,20 @@ pub async fn forward_responses(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    let is_compaction =
-        compaction_meta.is_some() || has_compaction_trigger(downstream_body);
+    let is_compaction = compaction_meta.is_some() || has_compaction_trigger(downstream_body);
     let implementation = "responses_compaction_v2";
-    let compaction_block = compaction_meta.cloned().unwrap_or_else(|| {
-        crate::request_build::default_compaction_metadata(implementation)
-    });
+    let compaction_block = compaction_meta
+        .cloned()
+        .unwrap_or_else(|| crate::request_build::default_compaction_metadata(implementation));
 
     let prepare_model = model.clone();
     let prepare = move |account: &Account, attempt_session: &SessionCtx| {
         let behavior = model_db.for_model(&prepare_model);
         let (turn_id, telem) = if is_compaction {
-            let mut start = telemetry.tracker.begin_compaction(
-                attempt_session,
-                &account.name,
-                &prepare_model,
-            );
+            let mut start =
+                telemetry
+                    .tracker
+                    .begin_compaction(attempt_session, &account.name, &prepare_model);
             let emissions = std::mem::take(&mut start.emissions);
             let turn_id = start.turn_id.clone();
             telemetry.emit(account, emissions);

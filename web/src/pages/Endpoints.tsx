@@ -126,7 +126,7 @@ env_key = "OPENAI_API_KEY"   # 值填「密钥」页生成的 sk- 访问密钥�
           <CopyButton text={cliConfig} />
         </CardHeader>
         <CardContent>
-          <pre className="rounded-md border bg-secondary/40 p-4 text-xs font-mono overflow-x-auto whitespace-pre">
+          <pre className="overflow-x-auto whitespace-pre rounded-lg border border-white/[0.06] bg-black/30 p-4 font-mono text-xs leading-relaxed text-foreground/90">
             {cliConfig}
           </pre>
         </CardContent>

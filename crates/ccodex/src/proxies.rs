@@ -233,16 +233,13 @@ impl ProxyStore {
         }
     }
 
-    /// Checks connectivity through one proxy (or the ambient default when url is None):
-    /// GET an IP echo service with a plain diagnostic reqwest client (deliberately not the
-    /// official client — this never touches the upstream API).
-    pub async fn check_proxy(url: Option<&str>) -> ProxyCheck {
+    /// Checks connectivity through one proxy target: GET an IP echo service with a plain
+    /// diagnostic reqwest client (deliberately not the official client — this never
+    /// touches the upstream API).
+    pub async fn check_proxy(target: ProxyProbe) -> ProxyCheck {
         let started = std::time::Instant::now();
-        let checked_at_unix = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let result = check_proxy_inner(url).await;
+        let checked_at_unix = crate::util::now_unix();
+        let result = check_proxy_inner(&target).await;
         let latency_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(ip) => ProxyCheck {
@@ -261,20 +258,57 @@ impl ProxyStore {
             },
         }
     }
+
+    /// URL of a named pool proxy (admin proxy-test lookup).
+    pub fn url_of(&self, name: &str) -> Option<String> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .proxies
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| p.url.clone())
+    }
 }
 
-async fn check_proxy_inner(url: Option<&str>) -> Result<String, String> {
+/// What a connectivity check should egress through.
+pub enum ProxyProbe {
+    /// Ambient process env (config upstream_proxy): the diagnostic client picks up the
+    /// env vars via reqwest's system-proxy logic.
+    Default,
+    /// No proxy at all, even if the ambient env sets one.
+    Direct,
+    /// This explicit proxy URL.
+    Url(String),
+}
+
+/// reqwest's Display only says "error sending request for url (...)"; the actionable cause
+/// (connect timeout, reset, TLS) lives in the source chain, so walk it for the UI.
+fn err_chain(e: &reqwest::Error) -> String {
+    let mut msg = e.to_string();
+    let mut src = std::error::Error::source(e);
+    while let Some(s) = src {
+        msg.push_str(&format!(": {s}"));
+        src = s.source();
+    }
+    msg
+}
+
+async fn check_proxy_inner(target: &ProxyProbe) -> Result<String, String> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
-    if let Some(url) = url {
-        let proxy = reqwest::Proxy::all(url).map_err(|e| format!("代理地址无效: {e}"))?;
-        builder = builder.proxy(proxy);
+    match target {
+        ProxyProbe::Default => {}
+        ProxyProbe::Direct => builder = builder.no_proxy(),
+        ProxyProbe::Url(url) => {
+            let proxy = reqwest::Proxy::all(url).map_err(|e| format!("代理地址无效: {e}"))?;
+            builder = builder.proxy(proxy);
+        }
     }
     let client = builder.build().map_err(|e| e.to_string())?;
     let resp = client
         .get("https://api.ipify.org?format=json")
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| err_chain(&e))?;
     let body: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     body.get("ip")
         .and_then(|v| v.as_str())
@@ -287,11 +321,13 @@ async fn check_proxy_inner(url: Option<&str>) -> Result<String, String> {
 /// because the quota fetch must hold it across .await (the official route-aware pool builds
 /// its reqwest client lazily at request time, reading the ambient proxy env then).
 static PROXY_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-// 必须同时写 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY：reqwest/hyper-util 的 intercept 对
-// http:// 目标只查 HTTP_PROXY/http_proxy（ALL_PROXY 只在没有按协议命中时兜底，且部分
-// 版本不用于 http 目标）。e2e 的本地 mock 是 http://，漏掉 HTTP_PROXY 会让"绑定代理"
-// 在该场景下静默失效。生产目标是 https://，但仍一并写齐以免场景差异。
-const PROXY_VARS: [&str; 6] = [
+// All of HTTP_PROXY/HTTPS_PROXY/ALL_PROXY (both cases) must be written: the
+// reqwest/hyper-util intercept consults only HTTP_PROXY/http_proxy for http:// targets
+// (ALL_PROXY is just a fallback when no per-scheme var hits, and some versions ignore it
+// for http targets). The e2e local mock is http://, so missing HTTP_PROXY would silently
+// disable a bound proxy there. Production targets are https://, but write the full set
+// to stay scenario-independent.
+pub(crate) const PROXY_VARS: [&str; 6] = [
     "HTTP_PROXY",
     "http_proxy",
     "HTTPS_PROXY",
@@ -385,14 +421,18 @@ pub async fn with_binding<T>(binding: &Binding, build: impl FnOnce() -> T) -> T 
     let _guard = ProxyEnvGuard::acquire(env_mode(binding)).await;
     #[cfg(debug_assertions)]
     if let Binding::Proxy { url, .. } = binding {
+        // Credentials embedded in proxy URLs must never reach the logs.
+        let redact = |v: Result<String, std::env::VarError>| {
+            v.ok().map(|s| crate::util::redact_url_credentials(&s))
+        };
         tracing::debug!(
-            proxy = %url,
-            http_proxy = ?std::env::var("http_proxy"),
-            HTTP_PROXY = ?std::env::var("HTTP_PROXY"),
-            https_proxy = ?std::env::var("https_proxy"),
-            HTTPS_PROXY = ?std::env::var("HTTPS_PROXY"),
-            all_proxy = ?std::env::var("all_proxy"),
-            ALL_PROXY = ?std::env::var("ALL_PROXY"),
+            proxy = %crate::util::redact_url_credentials(url),
+            http_proxy = ?redact(std::env::var("http_proxy")),
+            HTTP_PROXY = ?redact(std::env::var("HTTP_PROXY")),
+            https_proxy = ?redact(std::env::var("https_proxy")),
+            HTTPS_PROXY = ?redact(std::env::var("HTTPS_PROXY")),
+            all_proxy = ?redact(std::env::var("all_proxy")),
+            ALL_PROXY = ?redact(std::env::var("ALL_PROXY")),
             "with_binding env after swap"
         );
     }

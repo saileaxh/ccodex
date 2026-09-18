@@ -6,6 +6,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api, type AccountInfo, type KeyInfo, type PriceEntry, type UsageTotals } from "@/api";
+import { toast } from "@/components/ui/toast";
 
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
@@ -90,7 +91,8 @@ function UsageSummary() {
         <CardHeader>
           <CardTitle className="text-base">账号周期用量</CardTitle>
           <CardDescription>
-            周期按上游主限流窗口对齐（跟随配额快照的 resets_at 滚动），另列累计用量
+            按上游主限流窗口统计经过本机的请求；缓存命中包含在输入 Tokens 中，按缓存单价估算。
+            等效成本为参考 API 单价估算，不代表实际扣费。
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -141,7 +143,6 @@ function PricingTable() {
   const [entries, setEntries] = useState<PriceEntry[] | null>(null);
   const [drafts, setDrafts] = useState<Record<string, { input: string; cached: string; output: string }>>({});
   const [newModel, setNewModel] = useState("");
-  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
   const load = () => {
@@ -168,37 +169,33 @@ function PricingTable() {
     if (!d) return;
     const [input, cached, output] = [Number(d.input), Number(d.cached), Number(d.output)];
     if ([input, cached, output].some((v) => !Number.isFinite(v) || v < 0)) {
-      setError(`${model}: 价格需为非负数字`);
+      toast.error(`${model}: 价格需为非负数字`);
       return;
     }
-    setNotice("");
-    setError("");
     try {
       const r = await api.putPricing(model, input, cached, output);
       if (r.ok) {
-        setNotice(`${model} 定价已保存`);
+        toast.success(`${model} 定价已保存`);
         load();
       } else {
-        setError(r.error ?? "保存失败");
+        toast.error(r.error ?? "保存失败");
       }
     } catch (e) {
-      setError(String(e));
+      toast.error(String(e));
     }
   };
 
   const reset = async (model: string) => {
-    setNotice("");
-    setError("");
     try {
       const r = await api.deletePricing(model);
       if (r.ok) {
-        setNotice(`${model} 已恢复默认定价`);
+        toast.success(`${model} 已恢复默认定价`);
         load();
       } else {
-        setError(r.error ?? "恢复失败");
+        toast.error(r.error ?? "恢复失败");
       }
     } catch (e) {
-      setError(String(e));
+      toast.error(String(e));
     }
   };
 
@@ -209,7 +206,7 @@ function PricingTable() {
     setNewModel("");
     const r = await api.putPricing(m, 0, 0, 0);
     if (r.ok) load();
-    else setError(r.error ?? "添加失败");
+    else toast.error(r.error ?? "添加失败");
   };
 
   const setDraft = (model: string, field: "input" | "cached" | "output", value: string) => {
@@ -226,7 +223,6 @@ function PricingTable() {
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        {notice && <p className="text-sm text-emerald-400">{notice}</p>}
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Table>
           <TableHeader>

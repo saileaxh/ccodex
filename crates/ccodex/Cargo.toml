@@ -17,6 +17,7 @@ codex-http-client = { path = "../../vendor/codex/codex-rs/http-client" }
 codex-otel = { path = "../../vendor/codex/codex-rs/otel" }
 
 anyhow = "1"
+argon2 = "0.5"
 async-stream = "0.3"
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio", "query", "ws"] }
 bytes = "1"
@@ -32,6 +33,7 @@ rust-embed = "8"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+shadowsocks = { version = "=1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-2022", "security-replay-attack-detect"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "fs", "net"] }
 toml = "0.9"
 tracing = "0.1"

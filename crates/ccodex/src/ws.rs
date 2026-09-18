@@ -4,6 +4,12 @@
 //! are extracted verbatim and sent back as WS text frames — identical event content to the
 //! official WS protocol, with no parsing/re-serialization (the official ResponseEvent only
 //! implements Debug, so re-serializing it would inevitably drift).
+//!
+//! WS-only server features that need upstream response state are answered with the official
+//! wrapped previous_response_not_found error (retryable) instead of being silently
+//! mis-served: incremental frames (previous_response_id + input delta) and v2 prewarm
+//! (generate=false). The official client then retries with a full request, which the HTTP
+//! upstream leg can serve exactly.
 
 use crate::forward::{ForwardResult, RelayError, forward_responses};
 use crate::gateway::AppState;
@@ -37,6 +43,33 @@ async fn send_error(socket: &mut WebSocket, code: &str, message: &str) -> Result
         ))
         .await
 }
+
+/// Wrapped WS error frame per the official Responses WS protocol (codex-api
+/// WrappedWebsocketErrorEvent). With code "previous_response_not_found" the official client
+/// maps it to a retryable error and resends the turn with the FULL input — the sanctioned
+/// recovery when a server cannot honor incremental chaining.
+async fn send_wrapped_error(
+    socket: &mut WebSocket,
+    status: u16,
+    code: &str,
+    message: &str,
+) -> Result<(), axum::Error> {
+    socket
+        .send(Message::Text(
+            json!({
+                "type": "error",
+                "status": status,
+                "error": { "code": code, "message": message },
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+}
+
+const PREVIOUS_RESPONSE_NOT_FOUND: &str = "previous_response_not_found";
+const PREVIOUS_RESPONSE_NOT_FOUND_MSG: &str =
+    "Previous response was not found. Retrying the full request.";
 
 async fn connection_loop(
     state: Arc<AppState>,
@@ -100,6 +133,48 @@ async fn connection_loop(
         if let Some(obj) = body.as_object_mut() {
             obj.remove("type");
         }
+        // Incremental turns (e.g. queued follow-ups on a reused connection) carry
+        // previous_response_id + only the new input delta. Our upstream leg is HTTP SSE,
+        // whose official request struct has no response chaining at all, so the delta alone
+        // would reach the upstream stripped of the whole conversation. Answer with the
+        // official previous_response_not_found error: the client retries the turn with the
+        // full input, which we then serve normally.
+        if body
+            .get("previous_response_id")
+            .and_then(Value::as_str)
+            .is_some()
+        {
+            if send_wrapped_error(
+                &mut socket,
+                404,
+                PREVIOUS_RESPONSE_NOT_FOUND,
+                PREVIOUS_RESPONSE_NOT_FOUND_MSG,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            continue;
+        }
+        // v2 session prewarm (generate=false) is connection setup that expects a chainable
+        // response id back, which we cannot mint without running a real (billed) turn.
+        // Failing it the same retryable way resolves startup prewarm as best-effort
+        // unavailable; the first real turn then proceeds with a full request.
+        if body.get("generate").and_then(Value::as_bool) == Some(false) {
+            if send_wrapped_error(
+                &mut socket,
+                404,
+                PREVIOUS_RESPONSE_NOT_FOUND,
+                PREVIOUS_RESPONSE_NOT_FOUND_MSG,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            continue;
+        }
         if !handle_create(&state, &mut socket, &api_key, &headers, body).await {
             return;
         }
@@ -153,7 +228,7 @@ async fn handle_create(
                 .unwrap_or("")
                 .to_string();
             let mut tap = crate::sse_tap::SseTap::new();
-            // 该账号自己的 metrics client（与 analytics 同账号出口）
+            // The account's own metrics client (same-account egress as analytics).
             let tap_metrics = {
                 let pool = state.pool.read().unwrap();
                 state.telemetry.metrics_for_name(&pool, &account)
@@ -163,23 +238,20 @@ async fn handle_create(
             while let Some(chunk) = bytes.next().await {
                 let Ok(b) = chunk else {
                     tap.note_stream_error();
-                    let events = std::mem::take(&mut tap.metric_events);
-                    if let Some(metrics) = &tap_metrics {
-                        state.telemetry.metrics.sse_events(metrics, &model, &events);
-                    }
+                    crate::gateway::drain_sse_metrics(state, &tap_metrics, &model, &mut tap);
                     let _ = send_error(socket, "stream_error", "upstream stream interrupted").await;
                     return true;
                 };
                 tap.feed(&b);
-                let events = std::mem::take(&mut tap.metric_events);
-                if let Some(metrics) = &tap_metrics {
-                    state.telemetry.metrics.sse_events(metrics, &model, &events);
+                if let Some(usage) = tap.take_usage_for_accounting() {
+                    crate::gateway::record_stream_usage(
+                        state, crate::gateway::usage_key(api_key), &account, &model, usage,
+                    );
                 }
+                crate::gateway::drain_sse_metrics(state, &tap_metrics, &model, &mut tap);
                 buf.extend_from_slice(&b);
                 // SSE events are blank-line separated; extract each data payload as a WS frame.
-                while let Some(pos) = buf.windows(2).position(|w| w == b"\n\n") {
-                    let block: Vec<u8> = buf.drain(..pos).collect();
-                    let _ = buf.drain(..2.min(buf.len()));
+                while let Some(block) = crate::sse_tap::take_event(&mut buf) {
                     let Ok(text) = std::str::from_utf8(&block) else {
                         continue;
                     };
@@ -195,55 +267,23 @@ async fn handle_create(
                     }
                 }
             }
-            // Stream tail: same turn-tracker finalization as the HTTP path.
-            let pool_snapshot = state.pool.read().unwrap().clone();
-            match telem {
-                crate::forward::AttemptTelem::Turn { session_key, .. } => {
-                    let emissions = state.telemetry.tracker.note_response_end(
-                        &session_key,
-                        &account,
-                        &tap,
-                    );
-                    state
-                        .telemetry
-                        .emit_for_account_name(&pool_snapshot, &account, emissions);
-                }
-                crate::forward::AttemptTelem::Compaction(start) => {
-                    let (status, failure) = if tap.completed {
-                        ("completed", None)
-                    } else {
-                        (
-                            "failed",
-                            Some(crate::turns::failure_from_stream_error(tap.failed.as_ref())),
-                        )
-                    };
-                    let usage = tap.usage.as_ref().map(crate::turns::TokenAccum::from_wire);
-                    let emissions = state.telemetry.tracker.note_compaction_end(
-                        &telem_session,
-                        &account,
-                        &start,
-                        &crate::request_build::default_compaction_metadata(
-                            "responses_compaction_v2",
-                        ),
-                        "responses_compaction_v2",
-                        &model,
-                        crate::turns::CompactionOutcome {
-                            status,
-                            failure,
-                            usage,
-                        },
-                    );
-                    state
-                        .telemetry
-                        .emit_for_account_name(&pool_snapshot, &account, emissions);
-                }
-                crate::forward::AttemptTelem::None => {}
-            }
+            // Stream tail: same turn-tracker finalization + usage/cost accounting as the
+            // HTTP path (WS turns are billed too).
+            crate::gateway::finalize_stream_telemetry(
+                state,
+                telem,
+                &telem_session,
+                &account,
+                &model,
+                &crate::request_build::default_compaction_metadata("responses_compaction_v2"),
+                &tap,
+            );
+            let usage = tap.usage.take();
             tracing::info!(
                 account = %account,
                 completed = tap.completed,
-                usage = ?tap.usage,
-                failed = ?tap.failed,
+                usage = ?usage,
+                failed = ?tap.failed_code(),
                 "ws turn finished"
             );
             true

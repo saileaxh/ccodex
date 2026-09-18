@@ -265,6 +265,14 @@ pub fn build_upstream_request(
         .cloned()
         .unwrap_or_default();
 
+    // service_tier: officially None unless the client config sets one — pass it through
+    // (body field + routing-hint suffix), matching the official build.
+    let service_tier = obj
+        .and_then(|o| o.get("service_tier"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
     // ---- reasoning: explicit user value → model-name suffix (gpt-x-high style) → model default ----
     let user_reasoning = obj.and_then(|o| o.get("reasoning"));
     let user_effort = user_reasoning
@@ -375,13 +383,12 @@ pub fn build_upstream_request(
         &turn_metadata_json,
     );
     // Official build_routing_hint_header: codex backend (ChatGPT auth) always sends
-    // model=<slug>, with ;tier=<service_tier> appended when a tier is configured
-    // (ours never is — service_tier is omitted from the body for the same reason).
-    insert_header(
-        &mut extra_headers,
-        "x-codex-routing-hint",
-        &format!("model={model}"),
-    );
+    // model=<slug>, with ;tier=<service_tier> appended when a tier is configured.
+    let routing_hint = match &service_tier {
+        Some(tier) => format!("model={model};tier={tier}"),
+        None => format!("model={model}"),
+    };
+    insert_header(&mut extra_headers, "x-codex-routing-hint", &routing_hint);
 
     let (final_instructions, final_input, final_tools) = if behavior.use_responses_lite {
         insert_header(
@@ -442,7 +449,9 @@ pub fn build_upstream_request(
     body.insert("stream".into(), Value::Bool(true));
     // stream_options: officially None by default (concurrent_reasoning_summaries off) → omitted.
     body.insert("include".into(), json!(["reasoning.encrypted_content"]));
-    // service_tier: officially None unless configured → omitted.
+    if let Some(tier) = service_tier {
+        body.insert("service_tier".into(), Value::String(tier));
+    }
     body.insert(
         "prompt_cache_key".into(),
         Value::String(session.session_id.to_string()),
@@ -880,13 +889,14 @@ mod tests {
                 {"type":"function","name":"shell","description":"run","strict":true,"parameters":{"type":"object"}},
                 {"type":"web_search"}
             ],
+            // Configured tier passes through (official sends it when configured).
+            "service_tier": "priority",
             // Everything below must be ignored (no passthrough).
             "temperature": 0.9,
             "max_output_tokens": 100,
             "previous_response_id": "resp_x",
             "store": true,
             "stream": false,
-            "service_tier": "priority",
             "stream_options": {"include_obfuscation": false},
             "access_programs": ["x"],
         });
@@ -913,11 +923,17 @@ mod tests {
                 "store",
                 "stream",
                 "include",
+                "service_tier",
                 "prompt_cache_key",
                 "text",
                 "client_metadata"
             ],
             "lite body field set/order drifted from official"
+        );
+        assert_eq!(body["service_tier"], json!("priority"));
+        assert_eq!(
+            built.extra_headers["x-codex-routing-hint"],
+            "model=gpt-5.6-sol;tier=priority"
         );
         assert_eq!(body["parallel_tool_calls"], json!(false));
         assert_eq!(
@@ -1070,7 +1086,8 @@ mod tests {
     fn summary_default_from_model() {
         let db = test_db();
         let downstream = json!({"model":"gpt-5.2","input":[]});
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
+        let built =
+            build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         assert_eq!(
             built.body["reasoning"],
             json!({"effort":"medium","summary":"auto"})
@@ -1087,8 +1104,10 @@ mod tests {
             "input": [],
             "reasoning": {"effort":"ultra","summary":"detailed"},
             "text": {"verbosity":"high","format":{"type":"json_schema","schema":{"type":"object"},"strict":false}},
+            "service_tier": "default",
         });
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
+        let built =
+            build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         // gpt-5.5 has no max/ultra → resolves to the last supported non-ultra = xhigh.
         assert_eq!(
             built.body["reasoning"],
@@ -1100,6 +1119,12 @@ mod tests {
                 "verbosity":"high",
                 "format":{"type":"json_schema","strict":false,"schema":{"type":"object"},"name":"codex_output_schema"}
             })
+        );
+        // Configured tier passes through: body field + routing-hint suffix.
+        assert_eq!(built.body["service_tier"], json!("default"));
+        assert_eq!(
+            built.extra_headers["x-codex-routing-hint"],
+            "model=gpt-5.5;tier=default"
         );
     }
 
@@ -1118,7 +1143,8 @@ mod tests {
                 ]},
             ],
         });
-        let built = build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
+        let built =
+            build_upstream_request(&downstream, &session(), &db, "i", "t", 1, None).unwrap();
         let input = built.body["input"].as_array().unwrap();
         let user_msg = &input[2];
         assert!(
@@ -1140,8 +1166,8 @@ mod tests {
     #[test]
     fn missing_model_rejected() {
         let db = test_db();
-        let err =
-            build_upstream_request(&json!({"input":[]}), &session(), &db, "i", "t", 1, None).unwrap_err();
+        let err = build_upstream_request(&json!({"input":[]}), &session(), &db, "i", "t", 1, None)
+            .unwrap_err();
         assert!(matches!(err, BuildError::MissingModel));
     }
 

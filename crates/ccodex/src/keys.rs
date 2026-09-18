@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use crate::util::now_unix;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredKey {
     pub name: String,
@@ -20,22 +22,30 @@ pub struct KeyStore {
     inner: RwLock<Vec<StoredKey>>,
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Writes a secrets file owner-only (0600 on unix; the dir ACL governs on Windows).
+/// Writes a secrets file owner-only. On unix the file is created with 0600 atomically
+/// (no umask-default 0644 window between write and chmod); on Windows the dir ACL governs.
 pub(crate) fn write_restricted(path: &Path, text: &str) -> Result<(), String> {
-    std::fs::write(path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        // mode applies only at creation; an existing file keeps its mode, so re-enforce.
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
+        file.write_all(text.as_bytes())
+            .map_err(|e| format!("写入 {} 失败: {e}", path.display()))?;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, text).map_err(|e| format!("写入 {} 失败: {e}", path.display()))
+    }
 }
 
 impl KeyStore {
@@ -68,7 +78,13 @@ impl KeyStore {
     }
 
     pub fn contains(&self, key: &str) -> bool {
-        !key.is_empty() && self.inner.read().unwrap().iter().any(|k| k.key == key)
+        !key.is_empty()
+            && self
+                .inner
+                .read()
+                .unwrap()
+                .iter()
+                .any(|k| crate::util::ct_eq(k.key.as_bytes(), key.as_bytes()))
     }
 
     pub fn list(&self) -> Vec<StoredKey> {
@@ -90,8 +106,10 @@ impl KeyStore {
         let key = match key {
             Some(k) => {
                 let k = k.trim();
-                if k.len() < 16 {
-                    return Err("自带 key 至少 16 字符".to_string());
+                // Long enough that online guessing and offline fingerprint dictionary
+                // attacks (against usage.json) are both infeasible.
+                if k.len() < 24 {
+                    return Err("自带 key 至少 24 字符".to_string());
                 }
                 k.to_string()
             }

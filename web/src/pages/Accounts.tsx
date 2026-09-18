@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
 import { LogIn, RefreshCw, Trash2 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import { Badge, StatusDot } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import { api, type AccountInfo, type ProxyInfo, type QuotaInfo } from "@/api";
+import { api, type AccountInfo, type ProxyInfo } from "@/api";
+import { toast } from "@/components/ui/toast";
+import { cn } from "@/lib/utils";
 import { fmtCost, fmtTokens } from "@/pages/Cost";
 
 const PLAN_LABELS: Record<string, string> = {
@@ -34,6 +36,36 @@ function formatReset(resetsAt: number | null | undefined): string {
   return `${d.getMonth() + 1}-${d.getDate()} ${hh}:${mm} 重置`;
 }
 
+/** Thin quota meter; fill color is threshold status (<70% ok, 70–90% warn, ≥90% critical). */
+function QuotaMeter({ pct }: { pct: number }) {
+  const tone = pct >= 90 ? "bg-red-400" : pct >= 70 ? "bg-amber-400" : "bg-emerald-400";
+  return (
+    <div className="h-1 w-16 shrink-0 overflow-hidden rounded-full bg-white/[0.07]">
+      <div
+        className={cn("h-full rounded-full transition-all", tone)}
+        style={{ width: `${Math.min(100, Math.max(0, pct))}%` }}
+      />
+    </div>
+  );
+}
+
+function QuotaWindow({
+  window: w,
+}: {
+  window: { used_percent?: number | null; window_minutes?: number | null; resets_at?: number | null } | null | undefined;
+}) {
+  if (w?.used_percent == null) return null;
+  const reset = formatReset(w.resets_at);
+  return (
+    <div className="flex items-center gap-2">
+      <span className="w-10 shrink-0 text-muted-foreground">{windowLabel(w.window_minutes)}</span>
+      <QuotaMeter pct={w.used_percent} />
+      <span className="tabular-nums text-foreground/90">{Math.round(w.used_percent)}%</span>
+      {reset && <span className="text-muted-foreground/70">{reset}</span>}
+    </div>
+  );
+}
+
 function QuotaCell({
   acc,
   refreshing,
@@ -50,36 +82,34 @@ function QuotaCell({
   const period = acc.usage?.period;
   return (
     <div className="flex items-start gap-1.5">
-      <div className="space-y-0.5 text-xs text-muted-foreground">
+      <div className="space-y-1.5 text-xs">
         {plan && (
           <div>
             <Badge variant="outline">{PLAN_LABELS[plan] ?? plan}</Badge>
           </div>
         )}
-        {q?.primary?.used_percent != null && (
-          <div>
-            {windowLabel(q.primary.window_minutes)} 已用 {Math.round(q.primary.used_percent)}%
-            {q.primary.resets_at ? ` · ${formatReset(q.primary.resets_at)}` : ""}
-          </div>
-        )}
-        {q?.secondary?.used_percent != null && (
-          <div>
-            {windowLabel(q.secondary.window_minutes)} 已用 {Math.round(q.secondary.used_percent)}%
-            {q.secondary.resets_at ? ` · ${formatReset(q.secondary.resets_at)}` : ""}
-          </div>
-        )}
-        {q?.credits?.unlimited && <div>积分无限</div>}
+        <QuotaWindow window={q?.primary} />
+        <QuotaWindow window={q?.secondary} />
+        {q?.credits?.unlimited && <div className="text-muted-foreground">积分无限</div>}
         {q?.credits && !q.credits.unlimited && q.credits.balance != null && (
-          <div>积分余额 {q.credits.balance}</div>
+          <div className="text-muted-foreground">积分余额 {q.credits.balance}</div>
         )}
         {period && (
-          <div>
-            本周期用量 {fmtTokens(period.totals.input_tokens + period.totals.output_tokens)}
-            {" · 等效 "}
-            {fmtCost(period.totals.cost_usd)}
+          <div className="space-y-1 text-muted-foreground">
+            <div>
+              {windowLabel((period.end_unix - period.start_unix) / 60)}本机记录 {" "}
+              {fmtTokens(period.totals.input_tokens + period.totals.output_tokens)}
+              {" · 等效 "}{fmtCost(period.totals.cost_usd)}
+            </div>
+            <div>
+              {period.totals.requests} 次 · 输入 {fmtTokens(period.totals.input_tokens)}
+              （缓存 {fmtTokens(period.totals.cached_input_tokens)}）· 输出 {fmtTokens(period.totals.output_tokens)}
+            </div>
           </div>
         )}
-        {!q && !period && "—（流量经过时自动快照，或点右侧按钮主动查询）"}
+        {!q && !period && (
+          <span className="text-muted-foreground/70">—（流量经过时自动快照，或点右侧按钮主动查询）</span>
+        )}
       </div>
       <Button
         variant="ghost"
@@ -116,13 +146,25 @@ function StatusCell({ acc }: { acc: AccountInfo }) {
     <div className="space-y-1">
       <div>
         {st === "invalid" ? (
-          <Badge variant="destructive">凭证失效</Badge>
+          <Badge variant="destructive">
+            <StatusDot tone="bad" />
+            凭证失效
+          </Badge>
         ) : !acc.available ? (
-          <Badge variant="secondary">冷却中</Badge>
+          <Badge variant="warning">
+            <StatusDot tone="warn" />
+            冷却中
+          </Badge>
         ) : st === "ok" ? (
-          <Badge variant="success">可用</Badge>
+          <Badge variant="success">
+            <StatusDot tone="ok" />
+            可用
+          </Badge>
         ) : (
-          <Badge variant="outline">待验证</Badge>
+          <Badge variant="outline">
+            <StatusDot tone="idle" />
+            待验证
+          </Badge>
         )}
       </div>
       {st === "invalid" && (
@@ -142,7 +184,6 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
   const [reloading, setReloading] = useState(false);
   const [binding, setBinding] = useState<string | null>(null);
   const [quotaBusy, setQuotaBusy] = useState<string | null>(null);
-  const [notice, setNotice] = useState("");
 
   const load = () => {
     api
@@ -163,13 +204,13 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
 
   const bind = async (account: string, value: string) => {
     setBinding(account);
-    setNotice("");
     try {
       const r = await api.setAccountProxy(account, value === "" ? null : value);
-      setNotice(r.ok ? `${account} 出口已切换，客户端已重建` : (r.error ?? "绑定失败"));
+      if (r.ok) toast.success(`${account} 出口已切换，客户端已重建`);
+      else toast.error(r.error ?? "绑定失败");
       await load();
     } catch (e) {
-      setNotice(String(e));
+      toast.error(String(e));
     } finally {
       setBinding(null);
     }
@@ -177,13 +218,13 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
 
   const refreshQuota = async (account: string) => {
     setQuotaBusy(account);
-    setNotice("");
     try {
       const r = await api.refreshAccountQuota(account);
-      setNotice(r.ok ? `${account} 配额已更新` : `${account} 查询失败: ${r.error ?? "未知错误"}`);
+      if (r.ok) toast.success(`${account} 配额已更新`);
+      else toast.error(`${account} 查询失败: ${r.error ?? "未知错误"}`);
       await load();
     } catch (e) {
-      setNotice(String(e));
+      toast.error(String(e));
     } finally {
       setQuotaBusy(null);
     }
@@ -191,13 +232,13 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
 
   const reload = async () => {
     setReloading(true);
-    setNotice("");
     try {
       const r = await api.reloadAccounts();
-      setNotice(r.ok ? `已重载，共 ${r.accounts} 个账号` : `重载失败: ${r.error}`);
+      if (r.ok) toast.success(`已重载，共 ${r.accounts} 个账号`);
+      else toast.error(`重载失败: ${r.error}`);
       await load();
     } catch (e) {
-      setNotice(String(e));
+      toast.error(String(e));
     } finally {
       setReloading(false);
     }
@@ -210,18 +251,16 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
       )
     )
       return;
-    setNotice("");
-    setError("");
     try {
       const r = await api.removeAccount(acc.name);
       if (r.ok) {
-        setNotice(`已删除 ${acc.name}，剩余 ${r.accounts ?? "?"} 个账号`);
+        toast.success(`已删除 ${acc.name}，剩余 ${r.accounts ?? "?"} 个账号`);
         load();
       } else {
-        setError(r.error ?? "删除失败");
+        toast.error(r.error ?? "删除失败");
       }
     } catch (e) {
-      setError(String(e));
+      toast.error(String(e));
     }
   };
 
@@ -234,7 +273,6 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
           热重载
         </Button>
       </div>
-      {notice && <p className="text-sm text-muted-foreground">{notice}</p>}
       {error && <p className="text-sm text-destructive">{error}</p>}
       <Card>
         <CardHeader>
@@ -274,7 +312,7 @@ export default function AccountsPage({ onRelogin }: { onRelogin: (name: string) 
                   <TableCell>{formatCooldown(acc.cooldown_remaining_secs)}</TableCell>
                   <TableCell>
                     <select
-                      className="rounded-md border bg-background px-2 py-1 text-sm"
+                      className="rounded-md border border-white/[0.08] bg-white/[0.03] px-2 py-1 text-xs transition-colors focus:border-transparent focus:outline-none focus:ring-2 focus:ring-ring/60 disabled:opacity-50"
                       value={acc.proxy ?? ""}
                       disabled={binding === acc.name}
                       onChange={(e) => bind(acc.name, e.target.value)}

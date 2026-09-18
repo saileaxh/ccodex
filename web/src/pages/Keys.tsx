@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, Copy, Plus, ShieldCheck, Trash2 } from "lucide-react";
+import { CheckCircle2, Copy, Plus, ShieldCheck, Trash2, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { api, type KeyInfo } from "@/api";
+import { toast } from "@/components/ui/toast";
 import { fmtCost, fmtTokens, totalTokens } from "@/pages/Cost";
 
 function CopyButton({ text }: { text: string }) {
@@ -38,40 +39,36 @@ function formatTime(unix: number | null): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-/** 面板登录密钥（管理密钥）：与下方 sk 访问密钥完全独立，服务端只存 SHA-256 哈希。 */
+/** 面板登录密钥（管理密钥）：与下方 sk 访问密钥完全独立，服务端只存 argon2id 哈希。 */
 function AdminKeyCard() {
   const [current, setCurrent] = useState("");
   const [next, setNext] = useState("");
   const [confirm, setConfirm] = useState("");
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (next.trim().length < 8) {
-      setError("新密钥至少 8 个字符");
+      toast.error("新密钥至少 8 个字符");
       return;
     }
     if (next.trim() !== confirm) {
-      setError("两次输入的新密钥不一致");
+      toast.error("两次输入的新密钥不一致");
       return;
     }
     setBusy(true);
-    setNotice("");
-    setError("");
     try {
       const r = await api.setAdminKey(current, next.trim());
       if (r.ok) {
-        setNotice("登录密钥已更新，下次登录请使用新密钥");
+        toast.success("登录密钥已更新，下次登录请使用新密钥");
         setCurrent("");
         setNext("");
         setConfirm("");
       } else {
-        setError(r.error ?? "修改失败");
+        toast.error(r.error ?? "修改失败");
       }
     } catch (err) {
-      setError(String(err));
+      toast.error(String(err));
     } finally {
       setBusy(false);
     }
@@ -85,8 +82,8 @@ function AdminKeyCard() {
           <CardTitle className="text-base">面板登录密钥</CardTitle>
         </div>
         <CardDescription>
-          仅用于登录本管理面板，与下方 sk 访问密钥相互独立（不能混用）；服务端只存 SHA-256 哈希
-          （admin.json，0600），忘记后在服务器上删除该文件即可重新设置。
+          仅用于登录本管理面板，与下方 sk 访问密钥相互独立（不能混用）；服务端只存 argon2id 哈希
+          （admin.json，0600），忘记后在服务器上删除该文件并重启即可重新设置。
         </CardDescription>
       </CardHeader>
       <CardContent>
@@ -123,8 +120,6 @@ function AdminKeyCard() {
               />
             </div>
           </div>
-          {notice && <p className="text-sm text-emerald-400">{notice}</p>}
-          {error && <p className="text-sm text-destructive">{error}</p>}
           <Button type="submit" variant="outline" disabled={busy || !current || !next.trim()}>
             修改登录密钥
           </Button>
@@ -138,8 +133,9 @@ export default function KeysPage() {
   const [keys, setKeys] = useState<KeyInfo[] | null>(null);
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
-  const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  // Full key value of a freshly created key — the only moment it is ever shown.
+  const [justCreated, setJustCreated] = useState<{ name: string; key: string } | null>(null);
 
   const load = () => {
     api
@@ -153,19 +149,18 @@ export default function KeysPage() {
     e.preventDefault();
     if (!name.trim()) return;
     setBusy(true);
-    setNotice("");
-    setError("");
     try {
       const r = await api.addKey(name.trim());
-      if (r.ok) {
-        setNotice(`已创建 ${r.name}，key 完整显示在下表（此页面随时可回来看/复制）`);
+      if (r.ok && r.key) {
+        setJustCreated({ name: r.name ?? name.trim(), key: r.key });
+        toast.success(`已创建 ${r.name}，完整 key 仅在下方显示这一次，请立即复制保存`);
         setName("");
         load();
       } else {
-        setError(r.error ?? "创建失败");
+        toast.error(r.error ?? "创建失败");
       }
     } catch (err) {
-      setError(String(err));
+      toast.error(String(err));
     } finally {
       setBusy(false);
     }
@@ -173,18 +168,16 @@ export default function KeysPage() {
 
   const remove = async (k: KeyInfo) => {
     if (!window.confirm(`删除密钥「${k.name}」？使用它的客户端会立即失效。`)) return;
-    setNotice("");
-    setError("");
     try {
       const r = await api.deleteKey(k.name);
       if (r.ok) {
-        setNotice(`已删除 ${k.name}`);
+        toast.success(`已删除 ${k.name}`);
         load();
       } else {
-        setError(r.error ?? "删除失败");
+        toast.error(r.error ?? "删除失败");
       }
     } catch (err) {
-      setError(String(err));
+      toast.error(String(err));
     }
   };
 
@@ -194,7 +187,6 @@ export default function KeysPage() {
 
       <AdminKeyCard />
 
-      {notice && <p className="text-sm text-emerald-400">{notice}</p>}
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       <Card>
@@ -202,8 +194,8 @@ export default function KeysPage() {
           <CardTitle className="text-base">访问密钥（sk）</CardTitle>
           <CardDescription>
             客户端用 <code>Authorization: Bearer &lt;sk&gt;</code> 访问 /v1
-            接口；与面板登录密钥互不通用。密钥完整可见（本页即找回途径），只存于服务端
-            keys.json（0600），不来自任何配置文件。用量/成本按密钥指纹统计。
+            接口；与面板登录密钥互不通用。完整密钥仅在创建时显示一次，此后列表只显示掩码
+            ——丢失请在服务器 keys.json（0600）中查看，或删除后重建。用量/成本按密钥指纹统计。
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
@@ -219,6 +211,21 @@ export default function KeysPage() {
               生成密钥
             </Button>
           </form>
+
+          {justCreated && (
+            <div className="flex items-center justify-between gap-3 rounded-lg border border-emerald-400/30 bg-emerald-400/[0.06] px-3 py-2.5">
+              <div className="min-w-0">
+                <div className="text-xs text-emerald-300">「{justCreated.name}」的完整 key（仅显示这一次）</div>
+                <code className="text-xs break-all">{justCreated.key}</code>
+              </div>
+              <div className="flex shrink-0 items-center gap-1.5">
+                <CopyButton text={justCreated.key} />
+                <Button variant="ghost" size="icon" className="h-7 w-7" title="关闭" onClick={() => setJustCreated(null)}>
+                  <X className="h-3.5 w-3.5 text-muted-foreground" />
+                </Button>
+              </div>
+            </div>
+          )}
 
           <Table>
             <TableHeader>
@@ -237,10 +244,7 @@ export default function KeysPage() {
                 <TableRow key={k.name}>
                   <TableCell className="font-medium">{k.name}</TableCell>
                   <TableCell>
-                    <div className="flex items-center gap-2">
-                      <code className="text-xs break-all">{k.key}</code>
-                      <CopyButton text={k.key} />
-                    </div>
+                    <code className="text-xs text-muted-foreground">{k.key}</code>
                   </TableCell>
                   <TableCell className="text-xs">{k.usage?.requests ?? "—"}</TableCell>
                   <TableCell className="text-xs">

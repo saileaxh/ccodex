@@ -83,10 +83,10 @@ impl Config {
         if let Some(proxy) = &self.upstream_proxy {
             let lower = proxy.to_ascii_lowercase();
             let schemes = ["http://", "https://", "socks5://", "socks5h://"];
-            if !schemes.iter().any(|s| lower.starts_with(s)) {
-                anyhow::bail!(
-                    "upstream_proxy 仅支持 http/https/socks5/socks5h（可内嵌 user:pass@ 认证），当前: {proxy}"
-                );
+            if crate::shadowsocks_proxy::is_shadowsocks(proxy) {
+                crate::shadowsocks_proxy::parse_server(proxy)?;
+            } else if !schemes.iter().any(|s| lower.starts_with(s)) {
+                anyhow::bail!("upstream_proxy 仅支持 http/https/socks5/socks5h/ss");
             }
         }
         if let Some(platform) = &self.identity.ua_platform

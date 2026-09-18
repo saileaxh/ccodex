@@ -10,7 +10,7 @@ listen = "127.0.0.1:8317"
 accounts_dir = "./accounts"
 
 # 出站代理（写入 HTTPS_PROXY 等环境变量，与官方客户端同一条代理路径）
-# 支持 http:// https:// socks5:// socks5h://，可内嵌认证：socks5h://user:pass@127.0.0.1:1080
+# 支持 http:// https:// socks5:// socks5h:// 和内置 ss://（AEAD/AEAD-2022，详见 README）
 # 这是环境默认出口；管理面板「代理」页可维护命名代理池（存于 accounts_dir/../proxies.json），
 # 并按账号绑定出口
 upstream_proxy = "http://127.0.0.1:7890"

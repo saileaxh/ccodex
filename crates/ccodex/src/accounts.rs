@@ -13,6 +13,23 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::util::{now_millis, now_unix};
+
+/// Account names become path segments under accounts_dir, so they are a strict whitelist —
+/// a crafted name must never escape the dir (`..`), become drive-relative (`C:`), address
+/// an NTFS stream (`name:stream`), or alias another entry through trailing dots Windows
+/// strips (`foo.` == `foo`).
+pub fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.contains("..")
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
 /// Credential health verdict learned from upstream traffic. In-memory only: a restart
 /// re-probes once (one request → refresh → classify), which self-heals if auth.json was
 /// fixed on disk and re-marks a still-dead credential.
@@ -26,13 +43,6 @@ pub enum AuthStatus {
     /// successful refresh still yielding 401). Skipped in selection until a re-login
     /// rebuilds the account (pool reload creates fresh Account objects).
     Invalid { reason: String, since_unix: u64 },
-}
-
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 pub struct Account {
@@ -61,8 +71,9 @@ pub struct Account {
     pub transport: ReqwestTransport,
     /// Per-account official Statsig metrics client (exporter + periodic reader), built in
     /// the same binding swap as `transport` so its OTLP exports leave through the account's
-    /// own proxy — the same exit IP as this account's conversation traffic.
-    pub metrics: std::sync::Arc<codex_otel::MetricsClient>,
+    /// own proxy — the same exit IP as this account's conversation traffic. None when the
+    /// official crate disables the exporter (debug builds; official behavior there too).
+    pub metrics: Option<Arc<codex_otel::MetricsClient>>,
     cooldown_until_ms: AtomicU64,
     consecutive_failures: AtomicU64,
     /// Latest credential health verdict (see AuthStatus).
@@ -88,13 +99,6 @@ fn resolve_installation_id(account_dir: &Path) -> String {
         tracing::warn!(path = %path.display(), error = %e, "installation_id 落盘失败，本次进程内使用临时值");
     }
     id
-}
-
-fn now_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 impl Account {
@@ -293,9 +297,7 @@ impl Pool {
                 let binding = proxies.binding(&name);
                 let proxy_label = match &binding {
                     crate::proxies::Binding::Default => None,
-                    crate::proxies::Binding::Direct => {
-                        Some(crate::proxies::DIRECT.to_string())
-                    }
+                    crate::proxies::Binding::Direct => Some(crate::proxies::DIRECT.to_string()),
                     crate::proxies::Binding::Proxy { name, .. } => Some(name.clone()),
                 };
                 // Data plane and telemetry are built in one env swap: the account's metrics

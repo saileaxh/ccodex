@@ -62,6 +62,8 @@ pub struct AppState {
     /// in the background — the upstream payload is ~260KB and the official 5s interactive
     /// timeout is unworkable over high-latency proxy chains).
     pub models_cache: RwLock<Option<CachedModels>>,
+    /// Failed-login throttle guarding the panel key (lockout after repeated failures).
+    pub admin_throttle: crate::admin::AdminThrottle,
 }
 
 #[derive(Clone)]
@@ -251,7 +253,10 @@ pub fn spawn_models_refresh(state: Arc<AppState>) {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    // Downstream-facing API (sk Bearer). Auth runs as a middleware BEFORE the handlers'
+    // body extractors execute, so an unauthenticated client can't make the server buffer
+    // a request body at all; the handlers re-run authorize() to recover the key.
+    let api = Router::new()
         // HTTP (POST) and WS (GET upgrade) share the same paths, matching the official WS endpoint.
         .route(
             "/v1/responses",
@@ -271,23 +276,77 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/models", get(handle_models_cached))
         .route("/v1/models", get(handle_models_openai))
         .route("/backend-api/codex/models", get(handle_models_cached))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            downstream_auth_gate,
+        ));
+    Router::new()
+        .merge(api)
         .route("/health", get(handle_health))
         .merge(crate::admin::router(Arc::clone(&state)))
         .fallback(crate::web::static_handler)
-        // Responses 中转负载远大于 axum 默认 2MB：官方客户端发来的完整会话上下文轻松
-        // 超过该值，否则会被 "Failed to buffer the request body: length limit exceeded" 413
-        // 拒掉。关闭默认上限；真正的尺寸边界由上游与 nginx 决定。
-        .layer(axum::extract::DefaultBodyLimit::disable())
+        // Relay payloads far exceed axum's default 2MB body limit: an official client's
+        // full conversation context easily does, and would be 413-rejected with "Failed
+        // to buffer the request body: length limit exceeded". But with no cap at all an
+        // unauthenticated client could still make the server buffer an unbounded body
+        // (128 MiB per connection adds up), so a generous ceiling stays on; the real
+        // size boundary remains upstream and the reverse proxy in front.
+        .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
+        .layer(axum::middleware::from_fn(security_headers))
         .with_state(state)
 }
 
-async fn handle_health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(json!({
-        "status": "ok",
-        "accounts": state.pool.read().unwrap().len(),
-        "upstream_commit": env!("CCODEX_UPSTREAM_COMMIT"),
-        "identity_version": crate::identity::codex_version(),
-    }))
+/// Pre-extractor auth gate for the downstream API: rejects invalid/missing keys before any
+/// body bytes are read. The handler re-derives the key via authorize() (in-memory, cheap).
+async fn downstream_auth_gate(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if let Err(resp) = authorize(&state, req.headers()) {
+        return resp;
+    }
+    next.run(req).await
+}
+
+/// Baseline HTTP hardening headers on every response (panel, API and SPA alike). The CSP
+/// is attached to HTML only; the API's JSON/SSE payloads don't need it.
+async fn security_headers(req: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut resp = next.run(req).await;
+    let headers = resp.headers_mut();
+    headers.insert(
+        http::header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        http::header::X_FRAME_OPTIONS,
+        HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        http::header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    let is_html = headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("text/html"));
+    if is_html {
+        headers.insert(
+            http::header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static(
+                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+                 img-src 'self' data:; font-src 'self'; connect-src 'self'; \
+                 frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+            ),
+        );
+    }
+    resp
+}
+
+/// Unauthenticated liveness probe: deliberately minimal (public deployments answer this to
+/// anyone). Versions/account counts live behind the admin overview endpoint instead.
+async fn handle_health() -> impl IntoResponse {
+    Json(json!({ "status": "ok" }))
 }
 
 /// Downstream auth: `Authorization: Bearer <key>`. Valid = managed keys (keys.json);
@@ -327,7 +386,8 @@ fn error_response(status: StatusCode, kind: &str, message: &str) -> Response {
 }
 
 /// Response headers forwarded downstream: keep SSE type + upstream quota/trace info,
-/// drop hop-by-hop headers.
+/// drop hop-by-hop headers and upstream cookies (the cf session cookie binds to the
+/// account's exit IP — not something a downstream key holder should receive).
 fn downstream_headers(upstream: &HeaderMap) -> HeaderMap {
     const HOP_BY_HOP: &[&str] = &[
         "content-length",
@@ -336,6 +396,7 @@ fn downstream_headers(upstream: &HeaderMap) -> HeaderMap {
         "keep-alive",
         "upgrade",
         "content-encoding",
+        "set-cookie",
     ];
     let mut out = HeaderMap::new();
     for (name, value) in upstream.iter() {
@@ -359,6 +420,117 @@ fn downstream_compaction_meta(headers: &HeaderMap) -> Option<Value> {
     meta.get("compaction").filter(|c| c.is_object()).cloned()
 }
 
+/// Stream-tail turn telemetry, shared by the HTTP and WS paths: finalizes the tracked
+/// turn/compaction with the tap's measurements and fans the emissions out to the
+/// account's analytics + metrics channels.
+pub(crate) fn finalize_stream_telemetry(
+    state: &Arc<AppState>,
+    telem: crate::forward::AttemptTelem,
+    session: &crate::request_build::SessionCtx,
+    account: &str,
+    model: &str,
+    compaction_block: &Value,
+    tap: &SseTap,
+) {
+    let pool_snapshot = state.pool.read().unwrap().clone();
+    match telem {
+        crate::forward::AttemptTelem::Turn { session_key, .. } => {
+            let emissions = state
+                .telemetry
+                .tracker
+                .note_response_end(&session_key, account, tap);
+            state
+                .telemetry
+                .emit_for_account_name(&pool_snapshot, account, emissions);
+        }
+        crate::forward::AttemptTelem::Compaction(start) => {
+            // v2 compaction over /responses: close out with the response usage.
+            let (status, failure) = if tap.completed {
+                ("completed", None)
+            } else {
+                (
+                    "failed",
+                    Some(crate::turns::failure_from_stream_error(tap.failed.as_ref())),
+                )
+            };
+            let usage = tap.usage.as_ref().map(crate::turns::TokenAccum::from_wire);
+            let emissions = state.telemetry.tracker.note_compaction_end(
+                session,
+                account,
+                &start,
+                compaction_block,
+                "responses_compaction_v2",
+                model,
+                crate::turns::CompactionOutcome {
+                    status,
+                    failure,
+                    usage,
+                },
+            );
+            state
+                .telemetry
+                .emit_for_account_name(&pool_snapshot, account, emissions);
+        }
+        crate::forward::AttemptTelem::None => {}
+    }
+}
+
+/// Stream-tail usage/cost accounting, shared by the HTTP and WS paths. `key` is the
+/// downstream api key's (fingerprint, mask); None in open mode (account-only rows).
+pub(crate) fn record_stream_usage(
+    state: &Arc<AppState>,
+    key: Option<(String, String)>,
+    account: &str,
+    model: &str,
+    usage: Value,
+) {
+    let tokens = crate::usage::parse_usage_tokens(&usage);
+    let cost = state
+        .pricing
+        .cost_usd(model, tokens.0.saturating_sub(tokens.1), tokens.1, tokens.2);
+    let window = state
+        .pool
+        .read()
+        .unwrap()
+        .accounts()
+        .iter()
+        .find(|a| a.name == account)
+        .and_then(|a| a.period_window());
+    state.usage.record(key, account, window, tokens, cost);
+    tracing::info!(
+        account, model, input_tokens = tokens.0, cached_input_tokens = tokens.1,
+        output_tokens = tokens.2, cost_usd = cost, window = ?window,
+        "usage recorded"
+    );
+}
+
+/// Drains the tap's pending codex.sse_event samples into the account's metrics client
+/// (shared per-chunk step of the HTTP and WS streaming loops).
+pub(crate) fn drain_sse_metrics(
+    state: &AppState,
+    metrics: &Option<Arc<codex_otel::MetricsClient>>,
+    model: &str,
+    tap: &mut SseTap,
+) {
+    let events = std::mem::take(&mut tap.metric_events);
+    if let Some(metrics) = metrics {
+        state.telemetry.metrics.sse_events(metrics, model, &events);
+    }
+}
+
+/// Derives the per-key usage row identity from the downstream bearer: None in open mode
+/// (no downstream keys configured → no per-key rows, account accounting still runs).
+pub(crate) fn usage_key(api_key: &str) -> Option<(String, String)> {
+    if api_key.is_empty() {
+        None
+    } else {
+        Some((
+            crate::usage::key_fingerprint(api_key),
+            crate::keys::KeyStore::mask(api_key),
+        ))
+    }
+}
+
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -380,6 +552,22 @@ async fn handle_responses(
         }
     };
 
+    // Server-side response chaining needs upstream response state, which the stateless HTTP
+    // upstream leg does not have (the official HTTP request struct carries no such field —
+    // official clients only chain over WS, and our WS path maps those to full-input retries).
+    // Reject loudly instead of silently dropping the reference and losing the conversation.
+    if payload
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "previous_response_id chaining is not supported; resend the request with the full input",
+        );
+    }
+
     let session = derive_session(
         &api_key,
         &payload,
@@ -393,6 +581,9 @@ async fn handle_responses(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    // The downstream's own compaction block (real trigger/reason/phase) wins; only
+    // absent metadata falls back to the official default block at the stream tail.
+    let compaction_meta = downstream_compaction_meta(&headers);
     // The body is rebuilt inside forward per the official construction logic (with
     // per-account installation_id on switch); downstream fields are only semantically
     // extracted, never passed through.
@@ -407,7 +598,7 @@ async fn handle_responses(
         &state.sessions,
         state.config.max_account_switches(),
         state.config.request_compression(),
-        downstream_compaction_meta(&headers).as_ref(),
+        compaction_meta.as_ref(),
         &state.telemetry,
     )
     .await;
@@ -420,28 +611,18 @@ async fn handle_responses(
 
             let mut tap = SseTap::new();
             let tap_account = account.clone();
-            // 该账号自己的 metrics client：SSE 指标必须记进它自己的出口（与 analytics 同账号）
+            // The account's own metrics client: SSE metrics must egress through its own
+            // exit (same account as the analytics events).
             let tap_metrics = {
                 let pool = state.pool.read().unwrap();
                 state.telemetry.metrics_for_name(&pool, &tap_account)
             };
             let tap_state = Arc::clone(&state);
             let tap_model = requested_model.clone();
-            // Open mode (no downstream keys configured) has no bearer: skip per-key rows,
-            // still keep per-account accounting.
-            let tap_key = if api_key.is_empty() {
-                None
-            } else {
-                Some((
-                    crate::usage::key_fingerprint(&api_key),
-                    crate::keys::KeyStore::mask(&api_key),
-                ))
-            };
+            let tap_key = usage_key(&api_key);
             let telem_session = upstream.session.clone();
             let telem = upstream.telem;
-            // The downstream's own compaction block (real trigger/reason/phase) wins;
-            // only absent metadata falls back to the official default block.
-            let compaction_block = downstream_compaction_meta(&headers).unwrap_or_else(|| {
+            let compaction_block = compaction_meta.unwrap_or_else(|| {
                 crate::request_build::default_compaction_metadata("responses_compaction_v2")
             });
             let byte_stream = async_stream::stream! {
@@ -451,100 +632,37 @@ async fn handle_responses(
                     match chunk {
                         Ok(b) => {
                             tap.feed(&b);
-                            // Official codex.sse_event samples, emitted live per event.
-                            let events = std::mem::take(&mut tap.metric_events);
-                            if let Some(metrics) = &tap_metrics {
-                                tap_state.telemetry.metrics.sse_events(metrics, &tap_model, &events);
+                            if let Some(usage) = tap.take_usage_for_accounting() {
+                                record_stream_usage(&tap_state, tap_key.clone(), &tap_account, &tap_model, usage);
                             }
+                            drain_sse_metrics(&tap_state, &tap_metrics, &tap_model, &mut tap);
                             yield Ok::<_, codex_http_client::TransportError>(b);
                         }
                         Err(e) => {
                             tracing::warn!(account = %tap_account, error = %e, "upstream stream error");
                             tap.note_stream_error();
-                            let events = std::mem::take(&mut tap.metric_events);
-                            if let Some(metrics) = &tap_metrics {
-                                tap_state.telemetry.metrics.sse_events(metrics, &tap_model, &events);
-                            }
+                            drain_sse_metrics(&tap_state, &tap_metrics, &tap_model, &mut tap);
                             yield Err(e);
                         }
                     }
                 }
                 // Stream tail: turn-tracker finalization first (borrows tap.usage),
                 // then usage/cost accounting (takes it).
-                let pool_snapshot = tap_state.pool.read().unwrap().clone();
-                match telem {
-                    crate::forward::AttemptTelem::Turn { session_key, .. } => {
-                        let emissions = tap_state.telemetry.tracker.note_response_end(
-                            &session_key,
-                            &tap_account,
-                            &tap,
-                        );
-                        tap_state.telemetry.emit_for_account_name(
-                            &pool_snapshot,
-                            &tap_account,
-                            emissions,
-                        );
-                    }
-                    crate::forward::AttemptTelem::Compaction(start) => {
-                        // v2 compaction over /responses: close out with the response usage.
-                        let (status, failure) = if tap.completed {
-                            ("completed", None)
-                        } else {
-                            (
-                                "failed",
-                                Some(crate::turns::failure_from_stream_error(tap.failed.as_ref())),
-                            )
-                        };
-                        let usage = tap
-                            .usage
-                            .as_ref()
-                            .map(crate::turns::TokenAccum::from_wire);
-                        let emissions = tap_state.telemetry.tracker.note_compaction_end(
-                            &telem_session,
-                            &tap_account,
-                            &start,
-                            &compaction_block,
-                            "responses_compaction_v2",
-                            &tap_model,
-                            crate::turns::CompactionOutcome {
-                                status,
-                                failure,
-                                usage,
-                            },
-                        );
-                        tap_state.telemetry.emit_for_account_name(
-                            &pool_snapshot,
-                            &tap_account,
-                            emissions,
-                        );
-                    }
-                    crate::forward::AttemptTelem::None => {}
-                }
-                if let Some(usage) = tap.usage.take() {
-                    let tokens = crate::usage::parse_usage_tokens(&usage);
-                    let cost = tap_state.pricing.cost_usd(
-                        &tap_model,
-                        tokens.0.saturating_sub(tokens.1),
-                        tokens.1,
-                        tokens.2,
-                    );
-                    let window = tap_state
-                        .pool
-                        .read()
-                        .unwrap()
-                        .accounts()
-                        .iter()
-                        .find(|a| a.name == tap_account)
-                        .and_then(|a| a.period_window());
-                    tap_state
-                        .usage
-                        .record(tap_key, &tap_account, window, tokens, cost);
-                }
+                finalize_stream_telemetry(
+                    &tap_state,
+                    telem,
+                    &telem_session,
+                    &tap_account,
+                    &tap_model,
+                    &compaction_block,
+                    &tap,
+                );
+                let usage = tap.usage.take();
                 tracing::info!(
                     account = %tap_account,
                     completed = tap.completed,
-                    usage = ?tap.usage,
-                    failed = ?tap.failed,
+                    usage = ?usage,
+                    failed = ?tap.failed_code(),
                     "turn finished"
                 );
             };

@@ -41,7 +41,10 @@ const STATSIG_API_KEY_HEADER: &str = "statsig-api-key";
 /// account is its own official-client identity with its own egress, so the counter is
 /// recorded once per account client (same instrument, same `originator` tag value
 /// bounding as the official helper).
-pub fn build_account_client() -> Arc<MetricsClient> {
+/// Returns None when the official crate disables the exporter (debug builds resolve
+/// OtelExporter::Statsig to None — the official binary simply runs without metrics
+/// there). Release builds always get a live client.
+pub fn build_account_client() -> Option<Arc<MetricsClient>> {
     let version = crate::identity::codex_version();
     // Dev self-check: CCODEX_STATSIG_ENDPOINT_OVERRIDE points the OTLP exporter at
     // a local mock (bypasses the debug-build disable in resolve_exporter).
@@ -66,8 +69,13 @@ pub fn build_account_client() -> Arc<MetricsClient> {
     {
         config = config.with_export_interval(Duration::from_millis(ms));
     }
-    let client = MetricsClient::new(config)
-        .expect("Statsig metrics exporter builds with built-in config");
+    let client = match MetricsClient::new(config) {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::warn!(error = %e, "metrics exporter disabled (debug build), account runs without Statsig metrics");
+            return None;
+        }
+    };
     let _ = client.counter(
         codex_otel::PROCESS_START_METRIC,
         1,
@@ -78,7 +86,7 @@ pub fn build_account_client() -> Arc<MetricsClient> {
             ),
         )],
     );
-    Arc::new(client)
+    Some(Arc::new(client))
 }
 
 pub struct MetricsHub {
@@ -104,41 +112,33 @@ impl MetricsHub {
         ]
     }
 
-    /// Records into the account's own metrics client (its exporter egresses through the
-    /// account's bound proxy, so an account's metrics never ship from another account's IP).
-    fn emit(&self, client: &MetricsClient, f: impl FnOnce(&MetricsClient)) {
-        f(client);
-    }
-
     /// codex.thread.started [is_git=false] — official session start counter.
     pub fn thread_started(&self, client: &MetricsClient, model: &str) {
         let md = self.metadata_tags(model);
         let mut tags: Vec<(&str, &str)> = vec![("is_git", "false")];
         tags.extend(md);
-        self.emit(client, |c| {
-            let _ = c.counter("codex.thread.started", 1, &tags);
-        });
+        let _ = client.counter("codex.thread.started", 1, &tags);
     }
 
     /// Per-SSE-event codex.sse_event counter + duration (official log_sse_event).
-    pub fn sse_events(&self, client: &MetricsClient, model: &str, events: &[crate::sse_tap::SseMetricEvent]) {
-        if events.is_empty() {
-            return;
-        }
+    pub fn sse_events(
+        &self,
+        client: &MetricsClient,
+        model: &str,
+        events: &[crate::sse_tap::SseMetricEvent],
+    ) {
         let md = self.metadata_tags(model);
-        self.emit(client, |c| {
-            for (kind, success, wait_ms) in events {
-                let success = if *success { "true" } else { "false" };
-                let mut tags: Vec<(&str, &str)> = vec![("kind", kind.as_str()), ("success", success)];
-                tags.extend(md);
-                let _ = c.counter("codex.sse_event", 1, &tags);
-                let _ = c.record_duration(
-                    "codex.sse_event.duration_ms",
-                    Duration::from_millis(*wait_ms),
-                    &tags,
-                );
-            }
-        });
+        for (kind, success, wait_ms) in events {
+            let success = if *success { "true" } else { "false" };
+            let mut tags: Vec<(&str, &str)> = vec![("kind", kind.as_str()), ("success", success)];
+            tags.extend(md);
+            let _ = client.counter("codex.sse_event", 1, &tags);
+            let _ = client.record_duration(
+                "codex.sse_event.duration_ms",
+                Duration::from_millis(*wait_ms),
+                &tags,
+            );
+        }
     }
 
     /// Turn-end metrics (official tasks/mod.rs turn-final sequence).
@@ -152,61 +152,62 @@ impl MetricsHub {
         tool_calls: usize,
     ) {
         let md = self.metadata_tags(model);
-        self.emit(client, |c| {
-            if let Some(ms) = ttft_ms {
-                let tags: Vec<(&str, &str)> = md.to_vec();
-                let _ = c.record_duration(
-                    "codex.turn.ttft.duration_ms",
-                    Duration::from_millis(ms),
-                    &tags,
-                );
-            }
-            if let Some(ms) = ttfm_ms {
-                let tags: Vec<(&str, &str)> = md.to_vec();
-                let _ = c.record_duration(
-                    "codex.turn.ttfm.duration_ms",
-                    Duration::from_millis(ms),
-                    &tags,
-                );
-            }
+        if let Some(ms) = ttft_ms {
             let tags: Vec<(&str, &str)> = md.to_vec();
-            let _ = c.record_duration(
-                "codex.turn.e2e_duration_ms",
-                Duration::from_millis(e2e_ms),
+            let _ = client.record_duration(
+                "codex.turn.ttft.duration_ms",
+                Duration::from_millis(ms),
                 &tags,
             );
-            let mut tags: Vec<(&str, &str)> = vec![("tmp_mem_enabled", "false")];
-            tags.extend(md);
-            let _ = c.histogram(
-                "codex.turn.tool.call",
-                i64::try_from(tool_calls).unwrap_or(i64::MAX),
+        }
+        if let Some(ms) = ttfm_ms {
+            let tags: Vec<(&str, &str)> = md.to_vec();
+            let _ = client.record_duration(
+                "codex.turn.ttfm.duration_ms",
+                Duration::from_millis(ms),
                 &tags,
             );
-            let mut tags: Vec<(&str, &str)> =
-                vec![("active", "false"), ("tmp_mem_enabled", "false")];
-            tags.extend(md);
-            let _ = c.counter("codex.turn.network_proxy", 1, &tags);
-            let mut tags: Vec<(&str, &str)> = vec![
-                ("read_allowed", "false"),
-                ("feature_enabled", "false"),
-                ("config_use_memories", "false"),
-                ("has_citations", "false"),
-            ];
-            tags.extend(md);
-            let _ = c.counter("codex.turn.memory", 1, &tags);
-            let tags: Vec<(&str, &str)> = md.to_vec();
-            let _ = c.counter("codex.turn.unified_exec.running_processes", 0, &tags);
-        });
+        }
+        let tags: Vec<(&str, &str)> = md.to_vec();
+        let _ = client.record_duration(
+            "codex.turn.e2e_duration_ms",
+            Duration::from_millis(e2e_ms),
+            &tags,
+        );
+        let mut tags: Vec<(&str, &str)> = vec![("tmp_mem_enabled", "false")];
+        tags.extend(md);
+        let _ = client.histogram(
+            "codex.turn.tool.call",
+            i64::try_from(tool_calls).unwrap_or(i64::MAX),
+            &tags,
+        );
+        let mut tags: Vec<(&str, &str)> = vec![("active", "false"), ("tmp_mem_enabled", "false")];
+        tags.extend(md);
+        let _ = client.counter("codex.turn.network_proxy", 1, &tags);
+        let mut tags: Vec<(&str, &str)> = vec![
+            ("read_allowed", "false"),
+            ("feature_enabled", "false"),
+            ("config_use_memories", "false"),
+            ("has_citations", "false"),
+        ];
+        tags.extend(md);
+        let _ = client.counter("codex.turn.memory", 1, &tags);
+        let tags: Vec<(&str, &str)> = md.to_vec();
+        let _ = client.counter("codex.turn.unified_exec.running_processes", 0, &tags);
     }
 
     /// codex.task.compact [type, manual] — official compact task counter.
-    pub fn task_compact(&self, client: &MetricsClient, model: &str, compact_type: &str, manual: bool) {
+    pub fn task_compact(
+        &self,
+        client: &MetricsClient,
+        model: &str,
+        compact_type: &str,
+        manual: bool,
+    ) {
         let md = self.metadata_tags(model);
         let manual = if manual { "true" } else { "false" };
         let mut tags: Vec<(&str, &str)> = vec![("type", compact_type), ("manual", manual)];
         tags.extend(md);
-        self.emit(client, |c| {
-            let _ = c.counter("codex.task.compact", 1, &tags);
-        });
+        let _ = client.counter("codex.task.compact", 1, &tags);
     }
 }

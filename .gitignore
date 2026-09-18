@@ -18,6 +18,7 @@ config.local.toml
 # 冒烟测试日志与临时文件
 *.log
 testdata/*.log
+/testdata/codex_home/
 /tmp/
 
 # 系统杂物

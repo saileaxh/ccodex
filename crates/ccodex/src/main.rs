@@ -14,10 +14,12 @@ mod pricing;
 mod proxies;
 mod quota;
 mod request_build;
+mod shadowsocks_proxy;
 mod sse_tap;
 mod telemetry;
 mod turns;
 mod usage;
+mod util;
 mod web;
 mod ws;
 
@@ -99,11 +101,21 @@ fn main() -> anyhow::Result<()> {
             accounts_dir,
             config,
         } => {
+            if !accounts::valid_account_name(&name) {
+                anyhow::bail!("账号名无效（1-32 字符，只允许字母数字和 . _ -，不得以点开头/结尾）");
+            }
             let config = Config::load(&config)?;
+            let embedded =
+                shadowsocks_proxy::EmbeddedProxy::prepare(config.upstream_proxy.as_deref())?;
             // Proxy env vars must be set before the HTTP client is created (same proxy
             // path as the official client).
             if let Some(proxy) = &config.upstream_proxy {
-                apply_proxy_env(proxy);
+                apply_proxy_env(
+                    embedded
+                        .as_ref()
+                        .map_or(proxy.as_str(), |proxy| proxy.url()),
+                    embedded.is_some(),
+                );
             }
             let root = accounts_dir.unwrap_or_else(|| config.accounts_dir());
             let codex_home = root.join(&name);
@@ -114,11 +126,17 @@ fn main() -> anyhow::Result<()> {
                     let route = AuthRouteConfig::from_http_client_factory(HttpClientFactory::new(
                         OutboundProxyPolicy::ReqwestDefault,
                     ));
-                    login::oauth_login_cli(codex_home, &route).await
+                    shadowsocks_proxy::with_proxy(
+                        embedded,
+                        login::oauth_login_cli(codex_home, &route),
+                    )
+                    .await
                 })
         }
         Command::Serve { config } => {
             let cfg = Config::load(&config)?;
+            let embedded =
+                shadowsocks_proxy::EmbeddedProxy::prepare(cfg.upstream_proxy.as_deref())?;
 
             // Env vars must be written before the tokio multi-thread runtime starts:
             // 1) identity version (injection point of the patched official UA logic)
@@ -126,31 +144,31 @@ fn main() -> anyhow::Result<()> {
             // 2) outbound proxy (the official HTTP client reads env via reqwest's system
             //    proxy logic at build time)
             if let Some(proxy) = &cfg.upstream_proxy {
-                apply_proxy_env(proxy);
-                tracing::info!(proxy = %proxy, "upstream proxy configured");
+                apply_proxy_env(
+                    embedded
+                        .as_ref()
+                        .map_or(proxy.as_str(), |proxy| proxy.url()),
+                    embedded.is_some(),
+                );
+                tracing::info!(
+                    proxy = %util::redact_url_credentials(proxy),
+                    "upstream proxy configured"
+                );
             }
 
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?
-                .block_on(serve(cfg, config))
+                .block_on(shadowsocks_proxy::with_proxy(embedded, serve(cfg, config)))
         }
     }
 }
 
 /// Outbound proxy: written into the env vars reqwest's system-proxy logic reads (same
-/// proxy path as the official client). Existing env vars win.
-fn apply_proxy_env(proxy: &str) {
-    // 与 proxies::PROXY_VARS 同步：http:// 目标（e2e 的本地 mock）只查 HTTP_PROXY。
-    for var in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        if std::env::var(var).is_err() {
+/// proxy path as the official client). Embedded Shadowsocks overrides inherited proxies.
+fn apply_proxy_env(proxy: &str, force: bool) {
+    for var in proxies::PROXY_VARS {
+        if force || std::env::var(var).is_err() {
             // SAFETY: called in the single-threaded phase before the runtime starts.
             unsafe { std::env::set_var(var, proxy) };
         }
@@ -248,6 +266,7 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
             fetched_at_unix: 0,
             live: false,
         })),
+        admin_throttle: admin::AdminThrottle::new(),
     });
     gateway::spawn_models_refresh(Arc::clone(&state));
     telemetry::Telemetry::spawn_sweep(&state.telemetry, {
@@ -259,6 +278,17 @@ async fn serve(config: Config, config_path: PathBuf) -> anyhow::Result<()> {
     let addr: SocketAddr = listen
         .parse()
         .map_err(|e| anyhow::anyhow!("listen 地址无效 {listen}: {e}"))?;
+    if state.keys.is_empty() {
+        // Open mode (no key check at all) is intentional for local use — flag it loudly
+        // when the relay is reachable beyond loopback.
+        if addr.ip().is_loopback() {
+            tracing::warn!("keys.json 为空：本地开放模式，/v1 免鉴权（仅监听回环地址）");
+        } else {
+            tracing::warn!(
+                "keys.json 为空且监听非回环地址：/v1 当前无需任何密钥即可调用！请立即在面板中添加访问密钥"
+            );
+        }
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(
         listen = %addr,
@@ -275,6 +305,9 @@ fn import(
     accounts_dir: Option<PathBuf>,
     config_path: &std::path::Path,
 ) -> anyhow::Result<()> {
+    if !accounts::valid_account_name(name) {
+        anyhow::bail!("账号名无效（1-32 字符，只允许字母数字和 . _ -，不得以点开头/结尾）");
+    }
     let from = from.unwrap_or_else(|| dirs_home().join(".codex").join("auth.json"));
     if !from.exists() {
         anyhow::bail!(

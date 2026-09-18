@@ -13,6 +13,8 @@ use axum::{Json, Router};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use crate::util::now_unix;
+
 fn admin_error(status: StatusCode, message: &str) -> Response {
     (
         status,
@@ -21,8 +23,66 @@ fn admin_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
+/// Failed-login throttle guarding the panel key: after MAX_FAILURES consecutive failures
+/// the admin API is locked for LOCKOUT. Global rather than per-IP — the panel has exactly
+/// one operator, and per-IP buckets are trivially rotated past. Successful logins reset it
+/// and are never delayed.
+pub struct AdminThrottle {
+    inner: std::sync::Mutex<ThrottleState>,
+}
+
+struct ThrottleState {
+    failures: u32,
+    locked_until: Option<std::time::Instant>,
+}
+
+const MAX_FAILURES: u32 = 5;
+const LOCKOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+impl Default for AdminThrottle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdminThrottle {
+    pub fn new() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(ThrottleState {
+                failures: 0,
+                locked_until: None,
+            }),
+        }
+    }
+
+    fn locked(&self) -> bool {
+        let state = self.inner.lock().unwrap();
+        state.locked_until.is_some_and(|t| t > std::time::Instant::now())
+    }
+
+    fn record_failure(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.failures += 1;
+        if state.failures >= MAX_FAILURES {
+            state.failures = 0;
+            state.locked_until = Some(std::time::Instant::now() + LOCKOUT);
+            tracing::warn!(
+                lockout_secs = LOCKOUT.as_secs(),
+                "admin login locked after repeated failures"
+            );
+        }
+    }
+
+    fn record_success(&self) {
+        let mut state = self.inner.lock().unwrap();
+        state.failures = 0;
+        state.locked_until = None;
+    }
+}
+
 /// Panel auth: Bearer must be the login key from admin.json. Before first setup every
-/// admin endpoint (except auth-status / admin-key setup) is refused with 401.
+/// admin endpoint (except auth-status / admin-key setup) is refused with 401. Repeated
+/// failures trip a global lockout (429) so the key can't be brute-forced online.
 // Err carries a full Response (large) but only on the rare rejection path.
 #[allow(clippy::result_large_err)]
 pub(crate) fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
@@ -32,14 +92,22 @@ pub(crate) fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(
             "admin setup required: set a panel login key first",
         ));
     }
+    if state.admin_throttle.locked() {
+        return Err(admin_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "登录失败次数过多，面板已临时锁定，请稍后再试",
+        ));
+    }
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .unwrap_or("");
     if state.admin_auth.verify(bearer) {
+        state.admin_throttle.record_success();
         Ok(())
     } else {
+        state.admin_throttle.record_failure();
         Err(admin_error(StatusCode::UNAUTHORIZED, "invalid login key"))
     }
 }
@@ -219,13 +287,6 @@ pub struct UpstreamVersionCache {
     pub error: Option<String>,
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Queries the npm registry for the latest published @openai/codex version with a plain
 /// diagnostic client (env-proxy aware; never touches the codex upstream API).
 async fn fetch_latest_codex_version() -> Result<String, String> {
@@ -349,7 +410,7 @@ async fn handle_accounts(
         .map(|a| {
             let usage = state
                 .usage
-                .account_usage(&a.name)
+                .account_usage_in_window(&a.name, a.period_window(), now_unix())
                 .map(|u| {
                     json!({
                         "total": u.totals,
@@ -409,7 +470,7 @@ async fn handle_account_remove(
     Path(name): Path<String>,
 ) -> Result<Json<Value>, Response> {
     authorize_admin(&state, &headers)?;
-    if name.is_empty() || name.contains(['/', '\\', '.']) {
+    if !crate::accounts::valid_account_name(&name) {
         return Ok(Json(json!({ "ok": false, "error": "账号名无效" })));
     }
     let exists = state
@@ -476,8 +537,10 @@ async fn handle_proxy_add(
     }
 }
 
-/// GET /admin/api/keys: managed keys shown in full (the panel is the lost-key recovery
-/// path). Each row carries its usage totals (joined by key fingerprint).
+/// GET /admin/api/keys: keys are returned MASKED — the full value is shown exactly once,
+/// in the create response. Recovery of a lost key is via keys.json on the server, not via
+/// a list endpoint that dumps every secret to any holder of a panel session (or any proxy
+/// that logs response bodies). Each row carries its usage totals (joined by fingerprint).
 async fn handle_keys(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -495,7 +558,7 @@ async fn handle_keys(
                 .unwrap_or(Value::Null);
             json!({
                 "name": k.name,
-                "key": k.key,
+                "key": crate::keys::KeyStore::mask(&k.key),
                 "created_at_unix": k.created_at_unix,
                 "usage": usage,
             })
@@ -504,7 +567,8 @@ async fn handle_keys(
     Ok(Json(json!({ "keys": keys })))
 }
 
-/// POST /admin/api/keys {name, key?}: key omitted = generate `sk-<96 hex>`.
+/// POST /admin/api/keys {name, key?}: key omitted = generate `sk-<96 hex>`. The response
+/// carries the full key — the only time it is ever served over the API.
 async fn handle_key_add(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -567,7 +631,8 @@ async fn handle_proxy_remove(
 }
 
 /// POST /admin/api/proxies/test {name?}: name omitted/null tests the ambient default
-/// (config upstream_proxy), "direct" tests a direct connection.
+/// (config upstream_proxy), "direct" tests a direct connection (bypassing the ambient
+/// proxy env — a plain client build would silently inherit it).
 async fn handle_proxy_test(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -575,28 +640,19 @@ async fn handle_proxy_test(
 ) -> Result<Json<Value>, Response> {
     authorize_admin(&state, &headers)?;
     let name = body.get("name").and_then(Value::as_str);
-    let (url, store_as) = match name {
-        None => (state.config.upstream_proxy.clone(), None),
-        Some(crate::proxies::DIRECT) => (None, None),
-        Some(n) => {
-            let (proxies, _) = state.proxies.snapshot();
-            let entry = proxies
-                .iter()
-                .find(|p| p.get("name").and_then(Value::as_str) == Some(n));
-            match entry {
-                Some(e) => (
-                    e.get("url").and_then(Value::as_str).map(str::to_string),
-                    Some(n.to_string()),
-                ),
-                None => {
-                    return Ok(Json(
-                        json!({ "ok": false, "error": format!("代理 {n} 不存在") }),
-                    ));
-                }
+    let (probe, store_as) = match name {
+        None => (crate::proxies::ProxyProbe::Default, None),
+        Some(crate::proxies::DIRECT) => (crate::proxies::ProxyProbe::Direct, None),
+        Some(n) => match state.proxies.url_of(n) {
+            Some(url) => (crate::proxies::ProxyProbe::Url(url), Some(n.to_string())),
+            None => {
+                return Ok(Json(
+                    json!({ "ok": false, "error": format!("代理 {n} 不存在") }),
+                ));
             }
-        }
+        },
     };
-    let check = crate::proxies::ProxyStore::check_proxy(url.as_deref()).await;
+    let check = crate::proxies::ProxyStore::check_proxy(probe).await;
     if let Some(n) = store_as {
         state.proxies.set_check(&n, check.clone());
     }
@@ -672,8 +728,8 @@ fn valid_account_name(body: &Value) -> Result<String, String> {
         .unwrap_or("")
         .trim()
         .to_string();
-    if name.is_empty() || name.contains(['/', '\\', '.']) {
-        return Err("账号名不能为空，且不能包含 / \\ . 字符".to_string());
+    if !crate::accounts::valid_account_name(&name) {
+        return Err("账号名需为 1-32 字符，只允许字母数字和 . _ -（不得以点开头/结尾）".to_string());
     }
     Ok(name)
 }
@@ -760,11 +816,13 @@ async fn handle_device_login_start(
     };
 
     let session_id = uuid::Uuid::new_v4().to_string();
+    let verification_url = device.verification_url.clone();
+    let user_code = device.user_code.clone();
     state.logins.lock().unwrap().insert(
         session_id.clone(),
         crate::login::LoginSession {
-            verification_url: device.verification_url.clone(),
-            user_code: device.user_code.clone(),
+            verification_url: verification_url.clone(),
+            user_code: user_code.clone(),
             status: crate::login::LoginStatus::Pending,
         },
     );
@@ -798,8 +856,8 @@ async fn handle_device_login_start(
 
     Ok(Json(json!({
         "session_id": session_id,
-        "verification_url": state.logins.lock().unwrap().get(&session_id).map(|s| s.verification_url.clone()),
-        "user_code": state.logins.lock().unwrap().get(&session_id).map(|s| s.user_code.clone()),
+        "verification_url": verification_url,
+        "user_code": user_code,
     })))
 }
 

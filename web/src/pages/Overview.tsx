@@ -1,16 +1,10 @@
 import { useEffect, useState } from "react";
 import { Activity, ArrowUpCircle, GitCommit, Globe, RefreshCw, Server, Users } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import { Badge, StatusDot } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { api, type Overview, type UpstreamVersion } from "@/api";
-
-function formatCheckedAt(unix: number): string {
-  if (!unix) return "尚未检测";
-  const d = new Date(unix * 1000);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
-}
+import { toast } from "@/components/ui/toast";
 
 export default function OverviewPage() {
   const [data, setData] = useState<Overview | null>(null);
@@ -43,7 +37,7 @@ export default function OverviewPage() {
     try {
       setVersion(await api.refreshUpstreamVersion());
     } catch (e) {
-      setError(String(e));
+      toast.error(String(e));
     } finally {
       setRefreshing(false);
     }
@@ -67,18 +61,21 @@ export default function OverviewPage() {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold tracking-tight">概览</h1>
         <Badge variant={data.available > 0 ? "success" : "destructive"}>
+          <StatusDot tone={data.available > 0 ? "ok" : "bad"} />
           {data.available > 0 ? "运行中" : "无可用账号"}
         </Badge>
       </div>
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         {items.map(({ label, value, icon: Icon }) => (
-          <Card key={label}>
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">{label}</CardTitle>
-              <Icon className="h-4 w-4 text-muted-foreground" />
-            </CardHeader>
-            <CardContent>
-              <div className="text-xl font-semibold">{value}</div>
+          <Card key={label} className="transition-colors hover:border-white/[0.1]">
+            <CardContent className="flex items-center gap-4 p-5">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-indigo-400/10 text-indigo-300 ring-1 ring-inset ring-indigo-400/20">
+                <Icon className="h-[18px] w-[18px]" />
+              </div>
+              <div className="min-w-0">
+                <div className="truncate text-xs text-muted-foreground">{label}</div>
+                <div className="mt-0.5 truncate text-xl font-semibold tabular-nums tracking-tight">{value}</div>
+              </div>
             </CardContent>
           </Card>
         ))}
@@ -86,7 +83,7 @@ export default function OverviewPage() {
 
       <Card>
         <CardHeader className="flex flex-row items-center justify-between space-y-0">
-          <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
             <ArrowUpCircle className="h-4 w-4" /> 官方最新版本
           </CardTitle>
           <Button variant="ghost" size="sm" onClick={refreshVersion} disabled={refreshing}>
@@ -96,31 +93,36 @@ export default function OverviewPage() {
         </CardHeader>
         <CardContent className="space-y-2">
           <div className="flex items-center gap-3">
-            <span className="text-xl font-semibold">
+            <span className="text-xl font-semibold tabular-nums">
               {version?.latest ? `v${version.latest}` : "未知"}
             </span>
-            {upgradeAvailable && <Badge variant="success">可升级（当前 v{version?.baked}）</Badge>}
+            {upgradeAvailable && (
+              <Badge variant="warning">
+                <StatusDot tone="warn" />
+                可升级（当前 v{version?.baked}）
+              </Badge>
+            )}
             {version && !upgradeAvailable && version.latest && (
-              <Badge variant="secondary">已是最新</Badge>
+              <Badge variant="secondary">
+                <StatusDot tone="ok" />
+                已是最新
+              </Badge>
             )}
           </div>
-          <p className="text-xs text-muted-foreground">
-            来源 npm registry @openai/codex · 检测于 {formatCheckedAt(version?.checked_at_unix ?? 0)}
-            {version?.source === "cache" && ` · 缓存（${Math.round(version.ttl_secs / 3600)} 小时内访问不重复查询）`}
-            {version?.error && <span className="text-destructive"> · 上次查询失败: {version.error}</span>}
-          </p>
         </CardContent>
       </Card>
 
       <Card>
         <CardHeader>
-          <CardTitle className="text-sm font-medium text-muted-foreground flex items-center gap-2">
+          <CardTitle className="flex items-center gap-2 text-sm font-medium text-muted-foreground">
             <GitCommit className="h-4 w-4" /> 上游代码基线
           </CardTitle>
         </CardHeader>
         <CardContent>
-          <code className="text-sm break-all">{data.upstream_commit}</code>
-          <p className="text-xs text-muted-foreground mt-2">
+          <code className="rounded-md bg-white/[0.04] px-2 py-1 font-mono text-xs break-all text-indigo-200/90">
+            {data.upstream_commit}
+          </code>
+          <p className="mt-2 text-xs text-muted-foreground">
             请求头、指令、认证行为均直接来自 openai/codex 官方源码（该 commit）。
           </p>
         </CardContent>

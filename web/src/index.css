@@ -4,30 +4,53 @@
 
 @layer base {
   :root {
-    --background: 240 10% 3.9%;
-    --foreground: 0 0% 98%;
-    --card: 240 10% 3.9%;
-    --card-foreground: 0 0% 98%;
-    --primary: 0 0% 98%;
-    --primary-foreground: 240 5.9% 10%;
-    --secondary: 240 3.7% 15.9%;
-    --secondary-foreground: 0 0% 98%;
-    --muted: 240 3.7% 15.9%;
-    --muted-foreground: 240 5% 64.9%;
-    --accent: 240 3.7% 15.9%;
-    --accent-foreground: 0 0% 98%;
-    --destructive: 0 62.8% 50.6%;
+    --background: 224 32% 6%;
+    --foreground: 220 24% 95%;
+    --card: 223 26% 9%;
+    --card-foreground: 220 24% 95%;
+    --primary: 220 24% 95%;
+    --primary-foreground: 224 40% 8%;
+    --secondary: 223 16% 14%;
+    --secondary-foreground: 220 24% 92%;
+    --muted: 223 16% 13%;
+    --muted-foreground: 224 12% 60%;
+    --accent: 223 18% 15%;
+    --accent-foreground: 220 24% 95%;
+    --destructive: 0 72% 60%;
     --destructive-foreground: 0 0% 98%;
-    --border: 240 3.7% 15.9%;
-    --input: 240 3.7% 15.9%;
-    --ring: 240 4.9% 83.9%;
-    --radius: 0.5rem;
+    --border: 223 16% 15%;
+    --input: 223 16% 20%;
+    --ring: 239 84% 70%;
+    --radius: 0.625rem;
   }
   * {
     @apply border-border;
   }
   body {
-    @apply bg-background text-foreground;
+    @apply bg-background text-foreground antialiased;
     font-family: ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif;
+    /* Ambient indigo glow bleeding in from the top; pure decoration, pointer-transparent. */
+    background-image:
+      radial-gradient(60rem 24rem at 20% -10%, hsl(239 84% 64% / 0.08), transparent 60%),
+      radial-gradient(50rem 20rem at 85% -15%, hsl(210 90% 56% / 0.05), transparent 60%);
+    background-attachment: fixed;
+  }
+  ::selection {
+    background: hsl(239 84% 70% / 0.35);
+  }
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(223 16% 20%);
+    border-radius: 8px;
+    border: 2px solid hsl(var(--background));
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  code, kbd, pre, .font-mono {
+    font-family: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   }
 }

@@ -37,24 +37,28 @@ impl Telemetry {
         for emission in emissions {
             match emission {
                 Emission::ThreadInitialized(params) => {
-                    self.metrics.thread_started(&account.metrics, &params.model);
-                    sender.track(TrackEventRequest::ThreadInitialized(
+                    if let Some(metrics) = &account.metrics {
+                        self.metrics.thread_started(metrics, &params.model);
+                    }
+                    sender.track(TrackEventRequest::ThreadInitialized(Box::new(
                         ThreadInitializedEvent {
                             event_type: "codex_thread_initialized",
                             event_params: *params,
                         },
-                    ));
+                    )));
                 }
                 Emission::Turn(turn) => {
                     let model = turn.params.model.clone().unwrap_or_default();
-                    self.metrics.turn_finished(
-                        &account.metrics,
-                        &model,
-                        turn.ttft_ms,
-                        turn.ttfm_ms,
-                        turn.params.duration_ms.unwrap_or(0),
-                        turn.params.total_tool_call_count.unwrap_or(0),
-                    );
+                    if let Some(metrics) = &account.metrics {
+                        self.metrics.turn_finished(
+                            metrics,
+                            &model,
+                            turn.ttft_ms,
+                            turn.ttfm_ms,
+                            turn.params.duration_ms.unwrap_or(0),
+                            turn.params.total_tool_call_count.unwrap_or(0),
+                        );
+                    }
                     sender.track(TrackEventRequest::TurnEvent(Box::new(
                         CodexTurnEventRequest {
                             event_type: "codex_turn_event",
@@ -63,12 +67,14 @@ impl Telemetry {
                     )));
                 }
                 Emission::Compaction(compaction) => {
-                    self.metrics.task_compact(
-                        &account.metrics,
-                        &compaction.model,
-                        compaction.compact_type,
-                        compaction.manual,
-                    );
+                    if let Some(metrics) = &account.metrics {
+                        self.metrics.task_compact(
+                            metrics,
+                            &compaction.model,
+                            compaction.compact_type,
+                            compaction.manual,
+                        );
+                    }
                     sender.track(TrackEventRequest::Compaction(Box::new(
                         CodexCompactionEventRequest {
                             event_type: "codex_compaction_event",
@@ -90,7 +96,7 @@ impl Telemetry {
         pool.accounts()
             .iter()
             .find(|a| a.name == account_name)
-            .map(|a| std::sync::Arc::clone(&a.metrics))
+            .and_then(|a| a.metrics.clone())
     }
 
     /// Emit for an account identified by name (stream-tail path): looks the account up

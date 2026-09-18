@@ -66,6 +66,7 @@ export interface PeriodUsage {
   start_unix: number;
   end_unix: number;
   totals: UsageTotals;
+  partial: boolean;
 }
 
 export interface AccountAuthStatus {

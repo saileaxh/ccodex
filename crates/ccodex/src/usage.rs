@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use crate::util::now_unix;
+
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
 pub struct Totals {
     pub requests: u64,
@@ -45,6 +47,18 @@ pub struct PeriodUsage {
     pub start_unix: u64,
     pub end_unix: u64,
     pub totals: Totals,
+    #[serde(default = "legacy_period_is_partial")]
+    pub partial: bool,
+}
+
+fn legacy_period_is_partial() -> bool {
+    true
+}
+
+pub fn same_period(first: (u64, u64), second: (u64, u64)) -> bool {
+    first.1.saturating_sub(first.0) == second.1.saturating_sub(second.0)
+        && first.0.abs_diff(second.0) <= 60
+        && first.1.abs_diff(second.1) <= 60
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -66,16 +80,9 @@ pub struct UsageStore {
     inner: RwLock<UsageData>,
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Stable identity for stats rows; first 16 hex chars of SHA-256.
 pub fn key_fingerprint(key: &str) -> String {
-    crate::admin_auth::hash_token(key)[..16].to_string()
+    crate::util::sha256_hex(key)[..16].to_string()
 }
 
 /// Extracts (input, cached_input, output) from a Responses usage object.
@@ -137,6 +144,18 @@ impl UsageStore {
         cost: f64,
     ) {
         let now = now_unix();
+        self.record_at(key, account, window, tokens, cost, now);
+    }
+
+    fn record_at(
+        &self,
+        key: Option<(String, String)>,
+        account: &str,
+        window: Option<(u64, u64)>,
+        tokens: (u64, u64, u64),
+        cost: f64,
+        now: u64,
+    ) {
         let mut data = self.inner.write().unwrap();
         if let Some((fp, mask)) = key {
             let entry = data.keys.entry(fp).or_default();
@@ -145,11 +164,22 @@ impl UsageStore {
             entry.last_seen_unix = now;
         }
         let acc = data.accounts.entry(account.to_string()).or_default();
+        let had_unassigned_usage = acc.totals.requests > 0 && acc.period.is_none();
         acc.totals.add(tokens, cost);
         acc.last_seen_unix = now;
+        let window = window
+            .filter(|(start, end)| *start <= now && now < *end)
+            .or_else(|| {
+                acc.period.as_ref().and_then(|period| {
+                    (period.start_unix <= now && now < period.end_unix)
+                        .then_some((period.start_unix, period.end_unix))
+                })
+            });
         if let Some((start, end)) = window {
             match &mut acc.period {
-                Some(p) if p.end_unix == end => p.totals.add(tokens, cost),
+                Some(p) if same_period((p.start_unix, p.end_unix), (start, end)) => {
+                    p.totals.add(tokens, cost);
+                }
                 _ => {
                     let mut totals = Totals::default();
                     totals.add(tokens, cost);
@@ -157,6 +187,7 @@ impl UsageStore {
                         start_unix: start,
                         end_unix: end,
                         totals,
+                        partial: had_unassigned_usage,
                     });
                 }
             }
@@ -170,6 +201,22 @@ impl UsageStore {
 
     pub fn account_usage(&self, account: &str) -> Option<AccountUsage> {
         self.inner.read().unwrap().accounts.get(account).cloned()
+    }
+
+    pub fn account_usage_in_window(
+        &self,
+        account: &str,
+        window: Option<(u64, u64)>,
+        now: u64,
+    ) -> Option<AccountUsage> {
+        let mut usage = self.account_usage(account)?;
+        usage.period = usage.period.filter(|period| {
+            period.start_unix <= now
+                && now < period.end_unix
+                && window
+                    .is_none_or(|window| same_period((period.start_unix, period.end_unix), window))
+        });
+        Some(usage)
     }
 }
 
@@ -189,13 +236,96 @@ mod tests {
     }
 
     #[test]
+    fn reset_timestamp_jitter_and_restart_do_not_erase_period() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let store = UsageStore::load(&path);
+        let start = 1_789_289_017;
+        let end = start + 604_800;
+        for offset in [0, 1, 0, 1, 0] {
+            store.record_at(
+                None,
+                "acc",
+                Some((start + offset, end + offset)),
+                (100, 80, 10),
+                0.001,
+                start + 100,
+            );
+        }
+        let reloaded = UsageStore::load(&path);
+        reloaded.record_at(None, "acc", None, (100, 80, 10), 0.001, start + 101);
+        let usage = reloaded
+            .account_usage_in_window("acc", Some((start + 1, end + 1)), start + 102)
+            .unwrap();
+        let period = usage.period.unwrap();
+        assert_eq!(period.totals.requests, 6);
+        assert_eq!(period.totals.input_tokens, 600);
+        assert!((period.totals.cost_usd - 0.006).abs() < 1e-10);
+        assert_eq!((period.start_unix, period.end_unix), (start, end));
+        assert!(!period.partial);
+        assert!(
+            reloaded
+                .account_usage_in_window("acc", None, end)
+                .unwrap()
+                .period
+                .is_none()
+        );
+        reloaded.record_at(
+            None,
+            "acc",
+            Some((end, end + 604_800)),
+            (7, 0, 3),
+            0.002,
+            end + 1,
+        );
+        let usage = reloaded.account_usage("acc").unwrap();
+        assert_eq!(usage.totals.requests, 7);
+        assert_eq!(usage.period.unwrap().totals.requests, 1);
+    }
+
+    #[test]
+    fn legacy_period_is_marked_partial_without_changing_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage.json");
+        let data = serde_json::json!({"keys": {}, "accounts": {"acc": {
+            "totals": Totals {requests: 500, input_tokens: 10000, ..Totals::default()},
+            "last_seen_unix": 1500,
+            "period": {"start_unix": 1000, "end_unix": 2000,
+                "totals": Totals {requests: 2, input_tokens: 100, ..Totals::default()}}
+        }}});
+        std::fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+        let store = UsageStore::load(&path);
+        store.record_at(None, "acc", Some((1001, 2001)), (10, 0, 5), 0.01, 1501);
+        let usage = UsageStore::load(&path).account_usage("acc").unwrap();
+        assert_eq!(usage.totals.requests, 501);
+        let period = usage.period.unwrap();
+        assert!(period.partial);
+        assert_eq!(period.totals.requests, 3);
+        assert_eq!(period.totals.input_tokens, 110);
+    }
+
+    #[test]
     fn record_accumulates_and_rolls_period() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("usage.json");
         let store = UsageStore::load(&path);
         let key = Some(("fp1".to_string(), "sk-abc…6789".to_string()));
-        store.record(key.clone(), "acc", Some((1000, 2000)), (100, 0, 50), 0.01);
-        store.record(key.clone(), "acc", Some((1000, 2000)), (200, 10, 60), 0.02);
+        store.record_at(
+            key.clone(),
+            "acc",
+            Some((1000, 2000)),
+            (100, 0, 50),
+            0.01,
+            1500,
+        );
+        store.record_at(
+            key.clone(),
+            "acc",
+            Some((1000, 2000)),
+            (200, 10, 60),
+            0.02,
+            1501,
+        );
         let k = store.key_usage("fp1").unwrap();
         assert_eq!(k.totals.requests, 2);
         assert_eq!(k.totals.input_tokens, 300);
@@ -205,7 +335,7 @@ mod tests {
         assert_eq!((p.start_unix, p.end_unix), (1000, 2000));
         assert_eq!(p.totals.requests, 2);
         // New window (resets_at moved) rolls the period, keeps all-time totals.
-        store.record(key, "acc", Some((2000, 3000)), (5, 0, 5), 0.001);
+        store.record_at(key, "acc", Some((2000, 3000)), (5, 0, 5), 0.001, 2500);
         let a = store.account_usage("acc").unwrap();
         assert_eq!(a.totals.requests, 3);
         let p = a.period.as_ref().unwrap();

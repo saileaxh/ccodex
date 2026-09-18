@@ -17,6 +17,7 @@ pub type SseMetricEvent = (String, bool, u64);
 pub struct SseTap {
     buf: Vec<u8>,
     pub usage: Option<Value>,
+    usage_recorded: bool,
     pub failed: Option<Value>,
     pub completed: bool,
     /// Stream start (first feed) — baseline for TTFT/TTFM measurements.
@@ -41,6 +42,19 @@ impl SseTap {
         Self::default()
     }
 
+    pub fn take_usage_for_accounting(&mut self) -> Option<Value> {
+        if self.usage_recorded {
+            return None;
+        }
+        let usage = self
+            .usage
+            .as_ref()
+            .filter(|usage| usage.is_object())?
+            .clone();
+        self.usage_recorded = true;
+        Some(usage)
+    }
+
     pub fn feed(&mut self, chunk: &[u8]) {
         let now = Instant::now();
         if self.started.is_none() {
@@ -49,10 +63,7 @@ impl SseTap {
         }
         self.last_chunk_at = Some(now);
         self.buf.extend_from_slice(chunk);
-        // Events are separated by blank lines.
-        while let Some(pos) = find_double_newline(&self.buf) {
-            let event: Vec<u8> = self.buf.drain(..pos).collect();
-            self.buf.drain(..2.min(self.buf.len()));
+        while let Some(event) = take_event(&mut self.buf) {
             self.handle_event(&event, now);
         }
         // Defensive: drop abnormally long partial lines.
@@ -66,8 +77,13 @@ impl SseTap {
     pub fn note_stream_error(&mut self) {
         let now = Instant::now();
         let gap = self.gap_ms(now);
-        self.metric_events
-            .push(("unknown".to_string(), false, gap));
+        self.metric_events.push(("unknown".to_string(), false, gap));
+    }
+
+    /// Short failure code for logs — the full upstream error JSON (with its message text)
+    /// stays out of log output.
+    pub fn failed_code(&self) -> Option<&str> {
+        self.failed.as_ref()?.get("code")?.as_str()
     }
 
     fn gap_ms(&mut self, now: Instant) -> u64 {
@@ -116,12 +132,19 @@ impl SseTap {
         let Some(value) = data_json else {
             return;
         };
+        if matches!(
+            kind.as_str(),
+            "response.completed" | "response.failed" | "response.incomplete"
+        ) {
+            self.usage = value
+                .get("response")
+                .and_then(|response| response.get("usage"))
+                .filter(|usage| usage.is_object())
+                .cloned();
+        }
         match kind.as_str() {
             "response.completed" => {
                 self.completed = true;
-                if let Some(usage) = value.get("response").and_then(|r| r.get("usage")).cloned() {
-                    self.usage = Some(usage);
-                }
             }
             "response.failed" => {
                 self.failed = value.get("response").and_then(|r| r.get("error")).cloned();
@@ -171,22 +194,23 @@ impl SseTap {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                self.tool_calls.push((id, String::new(), item_type.to_string()));
+                self.tool_calls
+                    .push((id, String::new(), item_type.to_string()));
             }
             "message" => {
                 // TTFT counts messages only when they carry non-empty text; TTFM is
                 // the first assistant message item regardless.
-                let has_text = item
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .is_some_and(|parts| {
-                        parts.iter().any(|p| {
-                            p.get("type").and_then(|t| t.as_str()) == Some("output_text")
-                                && p.get("text")
-                                    .and_then(|t| t.as_str())
-                                    .is_some_and(|t| !t.is_empty())
-                        })
-                    });
+                let has_text =
+                    item.get("content")
+                        .and_then(|c| c.as_array())
+                        .is_some_and(|parts| {
+                            parts.iter().any(|p| {
+                                p.get("type").and_then(|t| t.as_str()) == Some("output_text")
+                                    && p.get("text")
+                                        .and_then(|t| t.as_str())
+                                        .is_some_and(|t| !t.is_empty())
+                            })
+                        });
                 if has_text {
                     self.mark_contentful(now);
                 }
@@ -195,16 +219,16 @@ impl SseTap {
                 }
             }
             "reasoning" => {
-                let has_summary = item
-                    .get("summary")
-                    .and_then(|s| s.as_array())
-                    .is_some_and(|parts| {
-                        parts.iter().any(|p| {
-                            p.get("text")
-                                .and_then(|t| t.as_str())
-                                .is_some_and(|t| !t.is_empty())
-                        })
-                    });
+                let has_summary =
+                    item.get("summary")
+                        .and_then(|s| s.as_array())
+                        .is_some_and(|parts| {
+                            parts.iter().any(|p| {
+                                p.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .is_some_and(|t| !t.is_empty())
+                            })
+                        });
                 if has_summary {
                     self.mark_contentful(now);
                 }
@@ -229,13 +253,62 @@ impl SseTap {
     }
 }
 
-fn find_double_newline(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|w| w == b"\n\n")
+/// Pops the next complete SSE event block (without its blank-line terminator) from the
+/// front of `buf`. Both LF and CRLF framing are accepted (the official eventsource
+/// parser takes either; the codex backend emits LF).
+pub(crate) fn take_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let (end, sep) = find_event_end(buf)?;
+    let event: Vec<u8> = buf.drain(..end).collect();
+    buf.drain(..sep.min(buf.len()));
+    Some(event)
+}
+
+/// Locates the blank-line event terminator: (event end offset, separator length).
+fn find_event_end(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        if buf[i] == b'\r'
+            && i + 3 < buf.len()
+            && buf[i + 1] == b'\n'
+            && buf[i + 2] == b'\r'
+            && buf[i + 3] == b'\n'
+        {
+            return Some((i, 4));
+        }
+        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
+            return Some((i, 2));
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_usage_is_available_before_eof_and_only_once() {
+        for kind in [
+            "response.completed",
+            "response.failed",
+            "response.incomplete",
+        ] {
+            let mut tap = SseTap::new();
+            let event = format!(
+                "data: {{\"type\":\"{kind}\",\"response\":{{\"usage\":{{\"input_tokens\":100,\"output_tokens\":5}}}}}}\n\n"
+            );
+            let split = event.len() / 2;
+            tap.feed(&event.as_bytes()[..split]);
+            assert!(tap.take_usage_for_accounting().is_none());
+            tap.feed(&event.as_bytes()[split..]);
+            let usage = tap.take_usage_for_accounting().unwrap();
+            assert_eq!(usage["input_tokens"], 100);
+            assert!(tap.usage.is_some());
+            tap.feed(event.as_bytes());
+            assert!(tap.take_usage_for_accounting().is_none());
+        }
+    }
 
     #[test]
     fn extracts_usage_from_completed_event() {
@@ -251,7 +324,9 @@ mod tests {
     #[test]
     fn records_metric_events_with_kind_and_success() {
         let mut tap = SseTap::new();
-        tap.feed(b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n");
+        tap.feed(
+            b"event: response.created\ndata: {\"type\":\"response.created\",\"response\":{}}\n\n",
+        );
         tap.feed(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n");
         tap.feed(b"event: response.failed\ndata: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"rate_limit_exceeded\"}}}\n\n");
         assert_eq!(tap.metric_events.len(), 3);

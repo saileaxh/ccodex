@@ -195,7 +195,7 @@ pub struct CodexTurnEventRequest {
 #[derive(Serialize)]
 #[serde(untagged)]
 pub enum TrackEventRequest {
-    ThreadInitialized(ThreadInitializedEvent),
+    ThreadInitialized(Box<ThreadInitializedEvent>),
     Compaction(Box<CodexCompactionEventRequest>),
     TurnEvent(Box<CodexTurnEventRequest>),
 }
@@ -346,7 +346,14 @@ async fn send_track_events(
         Ok(response) if response.status().is_success() => {}
         Ok(response) => {
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+            // Truncated: the body can carry upstream-internal error text.
+            let body: String = response
+                .text()
+                .await
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
             tracing::warn!("events failed with status {status}: {body}");
         }
         Err(err) => {
